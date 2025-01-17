@@ -4,244 +4,264 @@ import gym
 import numpy as np
 import carla
 import random
-import time
 import math
-import cv2
 
 from gym import spaces
-from stable_baselines3 import PPO
+from sb3_contrib import RecurrentPPO
+from sb3_contrib.ppo_recurrent.policies import MlpLstmPolicy
 from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import EvalCallback
 
 # ----------------------------------------------------------------------------------
-# 1) Custom CARLA Gym Environment
+# Helper Function: Lane offset & heading error
+# ----------------------------------------------------------------------------------
+def get_lane_center_offset_and_heading(world_map, vehicle_transform):
+    """
+    Calculate how far the vehicle is from lane center (lateral offset)
+    and the heading error (difference in orientation to the road center).
+
+    Returns:
+      lane_offset (float): Lateral distance to lane center [m].
+      heading_error (float): Orientation difference from lane heading [radians].
+    """
+    waypoint = world_map.get_waypoint(
+        vehicle_transform.location,
+        project_to_road=True,
+        lane_type=carla.LaneType.Driving
+    )
+    if waypoint is None:
+        return 0.0, 0.0
+
+    lane_transform = waypoint.transform
+
+    # Vehicle location & orientation
+    vx, vy = vehicle_transform.location.x, vehicle_transform.location.y
+    vehicle_yaw = math.radians(vehicle_transform.rotation.yaw)
+
+    # Lane center location & orientation
+    lx, ly = lane_transform.location.x, lane_transform.location.y
+    lane_yaw = math.radians(lane_transform.rotation.yaw)
+
+    # Right vector of lane center
+    right_vec = lane_transform.get_right_vector()
+    # Vector from lane center to vehicle
+    dx, dy = (vx - lx), (vy - ly)
+    # Lateral offset is the projection onto the lane's right vector
+    lane_offset = dx * right_vec.x + dy * right_vec.y
+
+    # Heading error in [-pi, pi]
+    heading_error = vehicle_yaw - lane_yaw
+    heading_error = (heading_error + math.pi) % (2 * math.pi) - math.pi
+
+    return lane_offset, heading_error
+
+
+def is_in_front(base_transform, check_transform):
+    """
+    Check if 'check_transform' is in front of 'base_transform' 
+    based on a forward vector dot product.
+    - We consider 'in front' if dot((check_loc - base_loc), forward_vector) > 0.
+    """
+    base_loc = base_transform.location
+    base_forward = base_transform.get_forward_vector()
+    check_loc = check_transform.location
+
+    dx = check_loc.x - base_loc.x
+    dy = check_loc.y - base_loc.y
+    dz = check_loc.z - base_loc.z
+
+    dot = dx * base_forward.x + dy * base_forward.y + dz * base_forward.z
+    return dot > 0  # True if in front, False if behind or orthogonal
+
+
+# ----------------------------------------------------------------------------------
+# Custom CARLA Gym Environment
 # ----------------------------------------------------------------------------------
 class CarlaEnv(gym.Env):
     """
-    A custom Gym environment for autonomous driving in CARLA.
-    Observations:
-        - For simplicity: a front camera image (e.g., 84x84x3) or
-          a vector containing speed, distance to lane center, etc.
-    Actions:
-        - [steer, throttle, brake]
-    Reward:
-        - Based on staying in lane, avoiding collisions, comfortable driving, etc.
+    A custom environment for CARLA focusing on lane-keeping (vector obs).
+    Observations: [speed, lane_offset, heading_error]
+    Actions: [steer, throttle, brake]
+    Rewards: 
+     - Keep lane offset small
+     - Heading alignment
+     - Target speed
+     - Large negative for collision
     """
     def __init__(self, config):
         super(CarlaEnv, self).__init__()
         
-        # Carla server configuration
         self.host = config.get("host", "localhost")
         self.port = config.get("port", 2000)
         self.timeout = config.get("timeout", 10.0)
-        
+        self.target_speed = config.get("target_speed", 12.0)  # 12 m/s ~ 43 km/h
+        self.max_episode_steps = config.get("max_episode_steps", 1000)
+
         # Connect to CARLA
         self.client = carla.Client(self.host, self.port)
         self.client.set_timeout(self.timeout)
         self.world = self.client.get_world()
-        
-        # Optionally set synchronous mode
-        self.synchronous_mode = config.get("synchronous_mode", False)
+        self.map = self.world.get_map()
+
+        # Synchronous mode if wanted
+        self.synchronous_mode = config.get("synchronous_mode", True)
         if self.synchronous_mode:
             settings = self.world.get_settings()
-            settings.synchronous_mode = True
             settings.fixed_delta_seconds = 0.05  # 20 FPS
+            settings.synchronous_mode = True
             self.world.apply_settings(settings)
         
-        # Spawn ego vehicle
-        self.blueprint_library = self.world.get_blueprint_library()
-        vehicle_bp = self.blueprint_library.find('vehicle.tesla.model3')
-        
-        # Spawn point
-        spawn_points = self.world.get_map().get_spawn_points()
-        self.spawn_point = random.choice(spawn_points)
-        self.vehicle = self.world.try_spawn_actor(vehicle_bp, self.spawn_point)
-        
-        # Collision sensor
-        col_sensor_bp = self.blueprint_library.find('sensor.other.collision')
-        self.collision_sensor = self.world.spawn_actor(
-            col_sensor_bp,
-            carla.Transform(),
-            attach_to=self.vehicle
-        )
-        self.collision_hist = []
-        self.collision_sensor.listen(lambda event: self._on_collision(event))
-        
-        # Camera sensor (if needed for image-based RL)
-        self.img_height = 84
-        self.img_width = 84
-        self.camera_bp = self.blueprint_library.find('sensor.camera.rgb')
-        self.camera_bp.set_attribute('image_size_x', f'{self.img_width}')
-        self.camera_bp.set_attribute('image_size_y', f'{self.img_height}')
-        self.camera_bp.set_attribute('fov', '90')
-        self.camera_init_transform = carla.Transform(carla.Location(x=1.5, z=2.4))
-        self.camera_sensor = self.world.spawn_actor(
-            self.camera_bp,
-            self.camera_init_transform,
-            attach_to=self.vehicle
-        )
-        self.front_camera = np.zeros((self.img_height, self.img_width, 3), dtype=np.uint8)
-        self.camera_sensor.listen(lambda image: self._process_camera(image))
-        
-        # Observation & Action space
-        # Here, we define an example for image-based + speed-based observation
-        # If you just want a vector observation, adapt accordingly.
-        # Observations: stack of camera image + speed
-        self.observation_space = spaces.Box(
-            low=0, high=255, shape=(self.img_height, self.img_width, 3), dtype=np.uint8
-        )
-        
-        # Actions: [steer, throttle, brake]
-        # steer in [-1, 1], throttle in [0, 1], brake in [0, 1]
+        self.bp_library = self.world.get_blueprint_library()
+
+        # Observation space: [speed, lane_offset, heading_error]
+        # Bound them reasonably, e.g. speed up to 40 m/s, lane offset ±5, heading_error ±π
+        low_obs = np.array([0.0, -5.0, -np.pi], dtype=np.float32)
+        high_obs = np.array([40.0, 5.0, np.pi], dtype=np.float32)
+        self.observation_space = spaces.Box(low=low_obs, high=high_obs, shape=(3,), dtype=np.float32)
+
+        # Action space: [steer, throttle, brake]
         self.action_space = spaces.Box(
             low=np.array([-1.0, 0.0, 0.0]),
             high=np.array([1.0, 1.0, 1.0]),
             shape=(3,),
             dtype=np.float32
         )
-        
-        # Additional fields
-        self.max_episode_steps = config.get("max_episode_steps", 1000)
-        self.episode_step = 0
-        self.max_speed = 30.0  # m/s
-        self.speed_weight = config.get("speed_weight", 0.1)
-        
-    def reset(self):
-        """Resets the environment for a new episode."""
-        self.episode_step = 0
-        
-        # Clean up the old vehicle and sensors
-        self._destroy_actors()
-        
-        # Respawn ego vehicle
-        self.vehicle = self.world.try_spawn_actor(
-            self.blueprint_library.find('vehicle.tesla.model3'),
-            random.choice(self.world.get_map().get_spawn_points())
-        )
-        
-        # Respawn collision sensor
-        col_sensor_bp = self.blueprint_library.find('sensor.other.collision')
-        self.collision_sensor = self.world.spawn_actor(
-            col_sensor_bp,
-            carla.Transform(),
-            attach_to=self.vehicle
-        )
+
+        # Placeholder for actors
+        self.vehicle = None
+        self.collision_sensor = None
         self.collision_hist = []
-        self.collision_sensor.listen(lambda event: self._on_collision(event))
-        
-        # Respawn camera
-        self.camera_sensor = self.world.spawn_actor(
-            self.camera_bp,
-            self.camera_init_transform,
-            attach_to=self.vehicle
-        )
-        self.front_camera = np.zeros((self.img_height, self.img_width, 3), dtype=np.uint8)
-        self.camera_sensor.listen(lambda image: self._process_camera(image))
-        
-        # Wait a bit to stabilize
+
+        self.episode_step = 0
+
+        # We define a reference transform for spawn filtering in front
+        # For example, let's define a pseudo "base" transform in the map center or random
+        # You can also define a static transform or the player's transform if known
+        # For demonstration, we'll pick the first spawn point as a reference
+        spawn_points = self.map.get_spawn_points()
+        if len(spawn_points) == 0:
+            raise ValueError("No spawn points available in the CARLA map!")
+        self.reference_transform = spawn_points[0]  # or any suitable reference
+
+    def reset(self):
+        # Clean up old actors
+        self._destroy_actors()
+        self.episode_step = 0
+        self.collision_hist.clear()
+
+        # Spawn vehicle in a random "valid" spawn point that is in front of self.reference_transform
+        spawn_points = self.map.get_spawn_points()
+        valid_spawn_points = [
+            sp for sp in spawn_points 
+            if is_in_front(self.reference_transform, sp)
+        ]
+        if not valid_spawn_points:
+            # Fallback: if no valid spawn points are "in front", just pick random
+            valid_spawn_points = spawn_points
+
+        spawn_point = random.choice(valid_spawn_points)
+        vehicle_bp = self.bp_library.find('vehicle.tesla.model3')
+        self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
+
+        # Collision sensor
+        col_bp = self.bp_library.find('sensor.other.collision')
+        col_sensor_transform = carla.Transform()
+        self.collision_sensor = self.world.spawn_actor(col_bp, col_sensor_transform, attach_to=self.vehicle)
+        self.collision_sensor.listen(lambda e: self._on_collision(e))
+
+        # Give the simulator a few ticks to stabilize
         for _ in range(10):
             if self.synchronous_mode:
                 self.world.tick()
             else:
                 self.world.wait_for_tick()
-        
-        # Return initial observation
+
         return self._get_observation()
-    
+
     def step(self, action):
-        """Executes one step in the environment."""
         self.episode_step += 1
-        
-        # Unpack action
+
+        # Apply action
         steer, throttle, brake = action
-        
-        # Apply control
-        control = carla.VehicleControl()
-        control.steer = float(steer)
-        control.throttle = float(throttle)
-        control.brake = float(brake)
+        control = carla.VehicleControl(
+            steer=float(steer),
+            throttle=float(throttle),
+            brake=float(brake)
+        )
         self.vehicle.apply_control(control)
-        
-        # Tick the server
+
+        # Advance simulation
         if self.synchronous_mode:
             self.world.tick()
         else:
             self.world.wait_for_tick()
-        
-        # Calculate reward
+
+        # Compute reward
         reward = self._get_reward()
-        
-        # Check termination conditions
+
+        # Check termination
         done = False
         if self.episode_step >= self.max_episode_steps:
             done = True
-        if len(self.collision_hist) > 0:  # collision happened
+        if len(self.collision_hist) > 0:
+            reward -= 100.0  # large penalty for collision
             done = True
-            reward -= 100.0
-        
-        # Get new observation
+
         obs = self._get_observation()
-        
-        # Return step information
-        info = {}
-        return obs, reward, done, info
-    
+        return obs, reward, done, {}
+
     def _get_observation(self):
         """
-        Returns the current observation. 
-        For example: front camera image. 
+        Observation: [speed, lane_offset, heading_error]
         """
-        # If you want to combine with speed or other sensor:
-        #   velocity = self.vehicle.get_velocity()
-        #   speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
-        #   ...
-        return self.front_camera
-    
-    def _get_reward(self):
-        """
-        Returns the reward based on current state.
-        Basic example:
-          - small positive reward for moving forward
-          - large negative reward for collisions
-          - additional shaping for staying in lane, etc.
-        """
-        # Speed-based reward
         velocity = self.vehicle.get_velocity()
         speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
-        # Encourage some moderate speed
-        speed_reward = -abs(speed - 10.0) * self.speed_weight
-        
-        # Additional terms could be added: lane-keeping, etc.
-        reward = speed_reward
-        
-        return float(reward)
-    
+
+        transform = self.vehicle.get_transform()
+        lane_offset, heading_error = get_lane_center_offset_and_heading(self.map, transform)
+
+        return np.array([speed, lane_offset, heading_error], dtype=np.float32)
+
+    def _get_reward(self):
+        """
+        Reward function focusing on:
+          - minimal lane offset
+          - minimal heading error
+          - hitting target speed
+        """
+        velocity = self.vehicle.get_velocity()
+        speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+
+        transform = self.vehicle.get_transform()
+        lane_offset, heading_error = get_lane_center_offset_and_heading(self.map, transform)
+
+        # 1) Speed reward: penalize squared difference from target
+        speed_error = speed - self.target_speed
+        speed_reward = -0.05 * (speed_error ** 2)
+
+        # 2) Lane offset penalty
+        lane_offset_pen = -1.0 * abs(lane_offset)
+
+        # 3) Heading error penalty
+        heading_pen = -0.5 * abs(heading_error)
+
+        return float(speed_reward + lane_offset_pen + heading_pen)
+
     def _on_collision(self, event):
-        """Collision callback."""
+        # log collision impulses
         impulse = event.normal_impulse
         intensity = math.sqrt(impulse.x**2 + impulse.y**2 + impulse.z**2)
         self.collision_hist.append(intensity)
-    
-    def _process_camera(self, image):
-        """Camera callback: convert raw data to RGB array."""
-        array = np.frombuffer(image.raw_data, dtype=np.uint8)
-        array = np.reshape(array, (image.height, image.width, 4))
-        self.front_camera = array[:, :, :3]
-        # Optionally resize or convert color space, e.g.:
-        self.front_camera = cv2.cvtColor(self.front_camera, cv2.COLOR_BGR2RGB)
-    
+
     def _destroy_actors(self):
-        """Clean-up all actors (sensors, vehicle) to avoid memory leaks."""
-        actors_to_destroy = [
-            self.collision_sensor,
-            self.camera_sensor,
-            self.vehicle
-        ]
-        for actor in actors_to_destroy:
-            if actor is not None:
-                actor.destroy()
-    
+        if self.collision_sensor:
+            self.collision_sensor.destroy()
+            self.collision_sensor = None
+        if self.vehicle:
+            self.vehicle.destroy()
+            self.vehicle = None
+
     def close(self):
-        """Close the environment properly."""
         self._destroy_actors()
         if self.synchronous_mode:
             settings = self.world.get_settings()
@@ -251,51 +271,76 @@ class CarlaEnv(gym.Env):
 
 
 # ----------------------------------------------------------------------------------
-# 2) Training Script
+# Training Script with Recurrent PPO (LSTM) from sb3_contrib
 # ----------------------------------------------------------------------------------
 def main():
-    # Configuration for the environment
     config = {
         "host": "localhost",
         "port": 2000,
         "timeout": 10.0,
-        "synchronous_mode": False,    # set True for synchronous mode
-        "max_episode_steps": 300,
-        "speed_weight": 0.1
+        "synchronous_mode": True,
+        "target_speed": 12.0,
+        "max_episode_steps": 500
     }
+
+    # Create and vectorize environment
+    env = DummyVecEnv([lambda: CarlaEnv(config)])
     
-    # Create Gym environment
-    env = CarlaEnv(config)
-    
-    # Wrap into a DummyVecEnv (required by SB3 for single env)
-    env = DummyVecEnv([lambda: env])
-    
-    # Create the model (PPO)
-    model = PPO(
-        "CnnPolicy",   # if using image-based observations
-        env,
+    # Create an evaluation environment for the callback (optional)
+    eval_env = DummyVecEnv([lambda: CarlaEnv(config)])
+
+    # Optional: an EvalCallback to track performance
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path='./logs_recurrent/',
+        log_path='./logs_recurrent/',
+        eval_freq=20_000,
+        deterministic=True,
+        render=False
+    )
+
+    # Use RecurrentPPO (LSTM policy) from sb3-contrib
+    # MlpLstmPolicy is a recurrent policy with LSTM layers
+    model = RecurrentPPO(
+        policy=MlpLstmPolicy,
+        env=env,
+        n_steps=128,            # shorter rollout length for RNN
+        batch_size=64,
+        learning_rate=3e-4,
+        gamma=0.99,
+        gae_lambda=0.95,
+        ent_coef=0.0,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        clip_range=0.2,
+        n_epochs=10,
         verbose=1,
-        tensorboard_log="./ppo_carla_tensorboard/"
+        tensorboard_log="./recurrent_ppo_carla_tensorboard/"
+    )
+
+    # Train for 500,000 timesteps
+    model.learn(
+        total_timesteps=500000,
+        callback=eval_callback
     )
     
-    # Train the model
-    # Adjust total_timesteps as needed (e.g., 100000 for a decent start)
-    model.learn(total_timesteps=10000)
-    
-    # Save the model
-    model.save("ppo_carla_model")
-    
-    # (Optional) Load the model later
-    # model = PPO.load("ppo_carla_model", env=env)
-    
-    # Test the trained model
-    obs = env.reset()
-    for _ in range(1000):
-        action, _states = model.predict(obs)
-        obs, reward, done, info = env.step(action)
-        env.render()  # optional if you implement a render() method
-        if done[0]:
-            obs = env.reset()
+    # Save final model
+    model.save("recurrent_ppo_carla_lane_center")
+    print("Training finished. Model saved as recurrent_ppo_carla_lane_center.zip")
+
+    # (Optional) Testing / inference
+    # model = RecurrentPPO.load("recurrent_ppo_carla_lane_center", env=env)
+    # obs = env.reset()
+    # lstm_states = None
+    # episode_starts = np.ones((env.num_envs,), dtype=bool)
+    # for _ in range(1000):
+    #     action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts, deterministic=True)
+    #     obs, reward, done, info = env.step(action)
+    #     episode_starts = done
+    #     if done[0]:
+    #         obs = env.reset()
+    #         lstm_states = None
+    #         episode_starts = np.ones((env.num_envs,), dtype=bool)
 
 
 if __name__ == "__main__":

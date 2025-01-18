@@ -6,11 +6,7 @@ import carla
 import math
 import threading
 
-
 class Sensor:
-    """
-    Abstract Sensor class. Subclasses must implement `listen()` and set up their callback.
-    """
     def __init__(self, vehicle):
         self.vehicle = vehicle
         self.sensor = None
@@ -93,18 +89,24 @@ class CameraSensor(Sensor):
 
 class CarlaGymEnv(gym.Env):
     """
-    An example Gym environment wrapping CARLA.
-    This environment:
-      - Spawns a single vehicle at a fixed or random spawn point.
-      - Attaches a semantic segmentation camera, collision, lane invasion, and GNSS sensors.
-      - Expects a continuous action (steer, throttle).
-      - Returns a simple reward based on collision, staying near lane center, etc.
-      - Renders the latest camera frame using PyGame if `render_mode='human'`.
+    A Gym environment wrapper for CARLA that spawns a vehicle with:
+      - Collision sensor
+      - Lane invasion sensor
+      - GNSS sensor
+      - Semantic segmentation camera
+
+    The environment expects a 2D continuous action [steer, throttle] in [-1, 1].
+    Observations are semantic segmentation images of shape (480, 640, 1) in [0, 1].
+    
+    Set display=True to open a PyGame window for rendering.
     """
 
-    metadata = {"render_modes": ["human"], "render_fps": 20}
-
-    def __init__(self, host='localhost', port=2000, render_mode='human'):
+    def __init__(self, host='localhost', port=2000, display=True):
+        """
+        :param host: CARLA server host
+        :param port: CARLA server port
+        :param display: bool, whether to open a PyGame window to display the camera feed
+        """
         super(CarlaGymEnv, self).__init__()
 
         # Connect to CARLA
@@ -130,23 +132,20 @@ class CarlaGymEnv(gym.Env):
         # Thread lock for image access
         self.image_lock = threading.Lock()
         self.agent_image = None  # semantic segmentation image stored as float in [0,1]
-        self.render_mode = render_mode
 
-        # PyGame
-        self.display = (self.render_mode == 'human')
+        # PyGame related
+        self.display = display
         if self.display:
             pygame.init()
             self.screen = pygame.display.set_mode((640, 480))
             pygame.display.set_caption("CARLA Semantic Segmentation")
             self.clock = pygame.time.Clock()
 
-        # Define action and observation space for Stable Baselines3
-        # Example:
-        #   action = [steer, throttle], each in [-1, 1]
+        # Define action and observation spaces
+        # Action: 2D continuous [steer, throttle]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
-        # Example observation space: semantic segmentation image
-        # shape = (480, 640, 1), values in [0,1]
+        # Observation: semantic segmentation image (480 x 640 x 1), values in [0,1]
         self.observation_space = spaces.Box(
             low=0.0,
             high=1.0,
@@ -199,7 +198,7 @@ class CarlaGymEnv(gym.Env):
         # Extract the semantic label from the red channel
         labels = array[:, :, 2].astype(np.float32)
 
-        # Normalize to [0,1] by dividing by the maximum label (22.0 is CARLA's default label range up to 22).
+        # Normalize to [0,1] by dividing by the maximum label (22.0 is CARLA's default upper label range).
         labels /= 22.0
 
         with self.image_lock:
@@ -239,11 +238,9 @@ class CarlaGymEnv(gym.Env):
         Apply action, perform a tick in the CARLA world,
         compute reward, and check for done.
         """
-        # Parse action
         steer = float(action[0])  # in [-1,1]
         throttle = float(action[1])  # in [-1,1]
-        # Example: scale throttle from [-1,1] to [0,1]
-        throttle = 0.5 * (throttle + 1.0)
+        throttle = 0.5 * (throttle + 1.0)  # scale [-1,1] to [0,1]
 
         # Apply control
         control = carla.VehicleControl()
@@ -254,7 +251,7 @@ class CarlaGymEnv(gym.Env):
         # Tick the world
         self.world.tick()
 
-        # Compute reward (placeholder example)
+        # Compute reward (very simple example)
         reward = 0.0
         done = False
         info = {}
@@ -265,19 +262,13 @@ class CarlaGymEnv(gym.Env):
             done = True
             info['collision'] = True
 
-        # Lane invasion check (just an example)
+        # Lane invasion penalty
         if len(self.lane_invasion_sensor.get_history()) > 0:
             reward -= 10.0
-            # Not necessarily done, but you can decide based on your scenario
 
-        # A small reward for "moving forward" (using speed)
+        # Reward for moving forward (scaled by speed)
         speed = self.get_vehicle_speed()
-        reward += speed * 0.1  # scale factor
-
-        # Example "max steps" cut-off could also be used
-        # if self.current_step >= self.max_steps:
-        #     done = True
-        #     info['TimeLimit.truncated'] = True
+        reward += speed * 0.1
 
         obs = self._get_observation()
         return obs, reward, done, info
@@ -288,14 +279,13 @@ class CarlaGymEnv(gym.Env):
         """
         with self.image_lock:
             if self.agent_image is None:
-                # Return zeros if no image yet
                 return np.zeros((480, 640, 1), dtype=np.float32)
             else:
                 return self.agent_image.copy()
 
-    def render(self, mode='human'):
+    def render(self):
         """
-        Renders the semantic segmentation camera feed via PyGame.
+        Renders the semantic segmentation camera feed via PyGame if display=True.
         """
         if not self.display or self.agent_image is None:
             return
@@ -307,7 +297,7 @@ class CarlaGymEnv(gym.Env):
         surf = pygame.surfarray.make_surface(img_3ch.swapaxes(0, 1))
         self.screen.blit(surf, (0, 0))
         pygame.display.flip()
-        self.clock.tick(self.metadata["render_fps"])
+        self.clock.tick(20)  # 20 FPS
 
     def close(self):
         """
@@ -344,7 +334,6 @@ class CarlaGymEnv(gym.Env):
             return None, None
 
         lane_center = waypoint.transform.location
-
         dx = vehicle_location.x - lane_center.x
         dy = vehicle_location.y - lane_center.y
 
@@ -353,5 +342,4 @@ class CarlaGymEnv(gym.Env):
         perpendicular_direction = carla.Vector3D(-lane_direction.y, lane_direction.x, 0)
 
         lateral_offset = dx * perpendicular_direction.x + dy * perpendicular_direction.y
-
         return lane_center, lateral_offset

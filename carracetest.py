@@ -1,34 +1,27 @@
+# usage_example.py
 import gym
-from stable_baselines3.common.vec_env import SubprocVecEnv
-from ppo4 import PPO
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
 
-def make_env(env_id):
-    def _init():
-        env = gym.make(env_id, continuous=True)
-        return env
-    return _init
+from your_carla_env_file import CarlaGymEnv  # Import the environment class
 
 def main():
-    env_fns = [make_env("CarRacing-v2") for _ in range(2)]
-    vec_env = SubprocVecEnv(env_fns)
-    
-    obs = vec_env.reset()
-    action_dim = vec_env.action_space.shape[0]
-    model = PPO(
-        in_channels=3,
-        dummy_img_height=96,
-        dummy_img_width=96,
-        action_dim=action_dim,
-        init_learning_rate=1e-4,
-        lr_konstant=0.1,
-        n_maxsteps=100_000,
-        roullout=2048,
-        n_epochs=10,
-        n_envs=2,
-        device="cpu"
-    )
+    env = CarlaGymEnv(render_mode='human')  # or 'human' for live rendering
+    env = DummyVecEnv([lambda: env])        # Wrap in a VecEnv for SB3
 
-    model.collect_rollouts(vec_env)
+    model = PPO("CnnPolicy", env, verbose=1)
+    model.learn(total_timesteps=10_000)
+
+    # Test the trained model
+    obs = env.reset()
+    for _ in range(1000):
+        action, _states = model.predict(obs)
+        obs, reward, done, info = env.step(action)
+        env.render()
+        if done:
+            obs = env.reset()
+
+    env.close()
 
 if __name__ == "__main__":
     main()

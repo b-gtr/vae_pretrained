@@ -96,7 +96,7 @@ class CarlaGymEnv(gym.Env):
       - Semantic segmentation camera
 
     The environment expects a 2D continuous action [steer, throttle] in [-1, 1].
-    Observations are semantic segmentation images of shape (480, 640, 1) in [0, 1].
+    Observations are semantic segmentation images in channel-first format: (1, 480, 640), in [0, 1].
     
     Set display=True to open a PyGame window for rendering.
     """
@@ -131,7 +131,8 @@ class CarlaGymEnv(gym.Env):
 
         # Thread lock for image access
         self.image_lock = threading.Lock()
-        self.agent_image = None  # semantic segmentation image stored as float in [0,1]
+        # We'll store the camera data in a (1, 480, 640) array
+        self.agent_image = None  
 
         # PyGame related
         self.display = display
@@ -145,11 +146,12 @@ class CarlaGymEnv(gym.Env):
         # Action: 2D continuous [steer, throttle]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
-        # Observation: semantic segmentation image (480 x 640 x 1), values in [0,1]
+        # Observation: single-channel image with shape (1, 480, 640), values in [0,1].
+        #   (channel-first format for Stable Baselines3).
         self.observation_space = spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(480, 640, 1),
+            shape=(1, 480, 640),
             dtype=np.float32
         )
 
@@ -159,7 +161,6 @@ class CarlaGymEnv(gym.Env):
         """
         Internal method to (re)spawn the vehicle and attach sensors.
         """
-        # Destroy old sensors/vehicle if they exist
         self._clear_sensors()
 
         # Spawn vehicle at a random or fixed spawn point
@@ -190,7 +191,7 @@ class CarlaGymEnv(gym.Env):
     def _on_camera_image(self, image):
         """
         Callback for the camera sensor. Converts the raw segmentation image
-        into a [0,1]-normalized single-channel array.
+        into a [0,1]-normalized single-channel array in channel-first format.
         """
         image.convert(carla.ColorConverter.Raw)
         array = np.frombuffer(image.raw_data, dtype=np.uint8)
@@ -198,12 +199,15 @@ class CarlaGymEnv(gym.Env):
         # Extract the semantic label from the red channel
         labels = array[:, :, 2].astype(np.float32)
 
-        # Normalize to [0,1] by dividing by the maximum label (22.0 is CARLA's default upper label range).
+        # Normalize to [0,1] by dividing by max label (22.0 is CARLA's default max label).
         labels /= 22.0
 
+        # Currently shape is (480, 640).
+        # Convert to channel-first format -> (1, 480, 640).
+        labels = np.expand_dims(labels, axis=0)
+
         with self.image_lock:
-            # Store as (480, 640, 1) so it matches the observation space shape
-            self.agent_image = np.expand_dims(labels, axis=-1)
+            self.agent_image = labels  # shape: (1, 480, 640)
 
     def _clear_sensors(self):
         """
@@ -251,7 +255,7 @@ class CarlaGymEnv(gym.Env):
         # Tick the world
         self.world.tick()
 
-        # Compute reward (very simple example)
+        # Compute reward (simple example)
         reward = 0.0
         done = False
         info = {}
@@ -276,23 +280,29 @@ class CarlaGymEnv(gym.Env):
     def _get_observation(self):
         """
         Returns the latest camera observation if available, else a zero array.
+        Note that we keep the shape (1, 480, 640) for channel-first.
         """
         with self.image_lock:
             if self.agent_image is None:
-                return np.zeros((480, 640, 1), dtype=np.float32)
+                return np.zeros((1, 480, 640), dtype=np.float32)
             else:
                 return self.agent_image.copy()
 
     def render(self):
         """
         Renders the semantic segmentation camera feed via PyGame if display=True.
+        Note: PyGame expects (width, height), so we transpose the channel-first array.
         """
         if not self.display or self.agent_image is None:
             return
 
-        # Convert the single channel [0,1] image to a 3-channel [0,255] image for PyGame
-        img_3ch = np.repeat(self.agent_image, 3, axis=-1) * 255
-        img_3ch = img_3ch.astype(np.uint8)
+        # self.agent_image shape: (1, 480, 640)
+        # Convert to (480, 640) for single-channel
+        img_2d = self.agent_image[0] * 255.0  # back to [0,255]
+        img_2d = img_2d.astype(np.uint8)
+
+        # Convert single channel to 3-ch for PyGame display
+        img_3ch = np.stack([img_2d, img_2d, img_2d], axis=-1)  # shape (480, 640, 3)
 
         surf = pygame.surfarray.make_surface(img_3ch.swapaxes(0, 1))
         self.screen.blit(surf, (0, 0))

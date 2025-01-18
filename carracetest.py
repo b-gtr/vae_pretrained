@@ -1,26 +1,25 @@
-# usage_example.py
+# train_car1.py
+
 import gym
-import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from carla_gym_env import CarlaGymEnv  # Adjust import to your file name
+from carla_gym_env import CarlaGymEnv  # Adjust to your file name
 
 def main():
-    # Create environment
-    env = CarlaGymEnv(display=True)  # or False if you don't want a PyGame window
-    env = DummyVecEnv([lambda: env])  # Wrap in VecEnv for SB3
+    env = CarlaGymEnv(display=False)  # or True to see PyGame
+    # Wrap in VecEnv for SB3
+    env = DummyVecEnv([lambda: env])
 
-    # Create and train model
-    model = PPO("CnnPolicy", env, verbose=1)
+    # Now we can use 'CnnPolicy' because we have channel-first images
+    model = PPO("CnnPolicy", env, verbose=1, device='cuda')  # or 'cpu'
     model.learn(total_timesteps=10_000)
 
-    # Test the trained model
     obs = env.reset()
     for _ in range(200):
-        action, _states = model.predict(obs)
+        action, _ = model.predict(obs)
         obs, reward, done, info = env.step(action)
-        env.render()  # If display=True
+        env.render()
         if done:
             obs = env.reset()
 

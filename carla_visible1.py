@@ -89,16 +89,14 @@ class CameraSensor(Sensor):
 
 class CarlaGymEnv(gym.Env):
     """
-    A Gym environment wrapper for CARLA that spawns a vehicle with:
+    A Gym environment that spawns a vehicle in CARLA with:
       - Collision sensor
       - Lane invasion sensor
       - GNSS sensor
       - Semantic segmentation camera
 
-    The environment expects a 2D continuous action [steer, throttle] in [-1, 1].
-    Observations are semantic segmentation images in channel-first format: (1, 480, 640), in [0, 1].
-    
-    Set display=True to open a PyGame window for rendering.
+    Observations: (480, 640, 1) normalized to [0,1] (channel-last).
+    Actions: 2D [steer, throttle] in [-1,1].
     """
 
     def __init__(self, host='localhost', port=2000, display=True):
@@ -129,12 +127,12 @@ class CarlaGymEnv(gym.Env):
         self.gnss_sensor = None
         self.camera_sensor = None
 
-        # Thread lock for image access
+        # Lock for image access
         self.image_lock = threading.Lock()
-        # We'll store the camera data in a (1, 480, 640) array
+        # We'll store the camera data in shape (480, 640, 1)
         self.agent_image = None  
 
-        # PyGame related
+        # PyGame
         self.display = display
         if self.display:
             pygame.init()
@@ -142,30 +140,27 @@ class CarlaGymEnv(gym.Env):
             pygame.display.set_caption("CARLA Semantic Segmentation")
             self.clock = pygame.time.Clock()
 
-        # Define action and observation spaces
-        # Action: 2D continuous [steer, throttle]
+        # ACTION SPACE: 2D continuous [steer, throttle] in [-1, 1]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
-        # Observation: single-channel image with shape (1, 480, 640), values in [0,1].
-        #   (channel-first format for Stable Baselines3).
+        # OBSERVATION SPACE: single-channel image (480, 640, 1) in [0,1]
+        # channel-last format: (H, W, C) so SB3's is_image_space(...) passes
         self.observation_space = spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(1, 480, 640),
+            shape=(480, 640, 1),
             dtype=np.float32
         )
 
         self.reset()
 
     def _init_actors(self):
-        """
-        Internal method to (re)spawn the vehicle and attach sensors.
-        """
+        # Destroy old sensors/vehicle if they exist
         self._clear_sensors()
 
-        # Spawn vehicle at a random or fixed spawn point
+        # Spawn vehicle at a random point
         vehicle_bp = self.blueprint_library.filter('vehicle.lincoln.mkz_2017')[0]
-        spawn_point = np.random.choice(self.spawn_points)  # random spawn
+        spawn_point = np.random.choice(self.spawn_points)
         self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
 
         # Collision sensor
@@ -184,35 +179,27 @@ class CarlaGymEnv(gym.Env):
         self.camera_sensor = CameraSensor(self.vehicle, self.blueprint_library, self.world, self._on_camera_image)
         self.camera_sensor.listen()
 
-        # Give the sensors some ticks to stabilize
+        # Stabilize
         for _ in range(10):
             self.world.tick()
 
     def _on_camera_image(self, image):
         """
-        Callback for the camera sensor. Converts the raw segmentation image
-        into a [0,1]-normalized single-channel array in channel-first format.
+        Convert the raw segmentation image to a [0,1] single-channel (480,640,1).
         """
         image.convert(carla.ColorConverter.Raw)
         array = np.frombuffer(image.raw_data, dtype=np.uint8)
-        array = array.reshape((image.height, image.width, 4))
-        # Extract the semantic label from the red channel
-        labels = array[:, :, 2].astype(np.float32)
+        array = array.reshape((image.height, image.width, 4))  # (480,640,4)
+        labels = array[:, :, 2].astype(np.float32)  # extract red channel
+        labels /= 22.0  # normalize to [0,1], 22 is CARLA default max label
 
-        # Normalize to [0,1] by dividing by max label (22.0 is CARLA's default max label).
-        labels /= 22.0
-
-        # Currently shape is (480, 640).
-        # Convert to channel-first format -> (1, 480, 640).
-        labels = np.expand_dims(labels, axis=0)
+        # shape => (480,640); expand to (480,640,1) for channel-last
+        labels = np.expand_dims(labels, axis=-1)
 
         with self.image_lock:
-            self.agent_image = labels  # shape: (1, 480, 640)
+            self.agent_image = labels
 
     def _clear_sensors(self):
-        """
-        Destroy existing sensors and vehicle.
-        """
         if self.camera_sensor:
             self.camera_sensor.destroy()
             self.camera_sensor = None
@@ -231,46 +218,38 @@ class CarlaGymEnv(gym.Env):
         self.agent_image = None
 
     def reset(self):
-        """
-        Gym reset. Respawns the vehicle and sensors, returns the initial observation.
-        """
         self._init_actors()
         return self._get_observation()
 
     def step(self, action):
-        """
-        Apply action, perform a tick in the CARLA world,
-        compute reward, and check for done.
-        """
         steer = float(action[0])  # in [-1,1]
         throttle = float(action[1])  # in [-1,1]
-        throttle = 0.5 * (throttle + 1.0)  # scale [-1,1] to [0,1]
+        throttle = 0.5 * (throttle + 1.0)  # scale to [0,1]
 
-        # Apply control
         control = carla.VehicleControl()
         control.steer = np.clip(steer, -1.0, 1.0)
         control.throttle = np.clip(throttle, 0.0, 1.0)
         self.vehicle.apply_control(control)
 
-        # Tick the world
+        # tick the world
         self.world.tick()
 
-        # Compute reward (simple example)
+        # simple reward shaping
         reward = 0.0
         done = False
         info = {}
 
-        # Collision penalty
+        # collision check
         if len(self.collision_sensor.get_history()) > 0:
             reward -= 50.0
             done = True
             info['collision'] = True
 
-        # Lane invasion penalty
+        # lane invasion
         if len(self.lane_invasion_sensor.get_history()) > 0:
             reward -= 10.0
 
-        # Reward for moving forward (scaled by speed)
+        # forward speed reward
         speed = self.get_vehicle_speed()
         reward += speed * 0.1
 
@@ -278,52 +257,36 @@ class CarlaGymEnv(gym.Env):
         return obs, reward, done, info
 
     def _get_observation(self):
-        """
-        Returns the latest camera observation if available, else a zero array.
-        Note that we keep the shape (1, 480, 640) for channel-first.
-        """
         with self.image_lock:
             if self.agent_image is None:
-                return np.zeros((1, 480, 640), dtype=np.float32)
+                return np.zeros((480, 640, 1), dtype=np.float32)
             else:
                 return self.agent_image.copy()
 
     def render(self):
         """
-        Renders the semantic segmentation camera feed via PyGame if display=True.
-        Note: PyGame expects (width, height), so we transpose the channel-first array.
+        Renders the camera feed via PyGame if display=True.
+        We'll convert single-channel to 3-channel for display.
         """
         if not self.display or self.agent_image is None:
             return
 
-        # self.agent_image shape: (1, 480, 640)
-        # Convert to (480, 640) for single-channel
-        img_2d = self.agent_image[0] * 255.0  # back to [0,255]
-        img_2d = img_2d.astype(np.uint8)
+        # shape: (480, 640, 1)
+        gray = (self.agent_image[..., 0] * 255).astype(np.uint8)  # (480,640)
+        rgb = np.stack([gray, gray, gray], axis=-1)  # (480,640,3)
 
-        # Convert single channel to 3-ch for PyGame display
-        img_3ch = np.stack([img_2d, img_2d, img_2d], axis=-1)  # shape (480, 640, 3)
-
-        surf = pygame.surfarray.make_surface(img_3ch.swapaxes(0, 1))
+        surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
         self.screen.blit(surf, (0, 0))
         pygame.display.flip()
-        self.clock.tick(20)  # 20 FPS
+        self.clock.tick(20)
 
     def close(self):
-        """
-        Cleanup upon closing the environment.
-        """
         if self.display:
             pygame.quit()
-
-        # Restore original CARLA settings
         self.world.apply_settings(self.original_settings)
         self._clear_sensors()
 
     def get_vehicle_speed(self):
-        """
-        Returns the speed of the vehicle in m/s.
-        """
         if not self.vehicle:
             return 0.0
         vel = self.vehicle.get_velocity()

@@ -1,502 +1,507 @@
-#!/usr/bin/env python
-
 import gym
-import numpy as np
-import random
-import math
-import carla
 import pygame
-import sys
-
+import numpy as np
 from gym import spaces
+from gym.utils import seeding
 
-# Recurrent PPO with LSTM policy that supports multi-input
-from sb3_contrib import RecurrentPPO
-from sb3_contrib.ppo_recurrent.policies import MultiInputLstmPolicy
+import carla
+import random
+import time
+import math
 
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.callbacks import EvalCallback
+#########################
+# CarlaGymEnv-Klasse
+#########################
 
-####################################################################################
-# 1) A simple color palette for semantic segmentation classes in CARLA
-####################################################################################
-SEMSEG_PALETTE = {
-    0:  (  0,   0,   0),     # Unlabeled
-    1:  ( 70,  70,  70),     # Building
-    2:  (190, 153, 153),     # Fence
-    3:  ( 72,   0,  90),     # Other
-    4:  (220,  20,  60),     # Pedestrian
-    5:  (153, 153, 153),     # Pole
-    6:  (157, 234,  50),     # RoadLines
-    7:  (128,  64, 128),     # Road
-    8:  (244,  35, 232),     # Sidewalk
-    9:  (107, 142,  35),     # Vegetation
-    10: (  0,   0, 142),     # Vehicle
-    11: (102, 102, 156),     # Wall
-    12: (220, 220,   0),     # TrafficSign
-    # Add more if you need them...
-}
-
-def apply_semseg_palette(semseg_id_img: np.ndarray) -> np.ndarray:
+class CarlaGymEnv(gym.Env):
     """
-    Map each pixel's class ID to a color using SEMSEG_PALETTE.
-    Output shape: (H, W, 3).
+    Carla Gym-Wrapper zum Trainieren mit SB3 (MultiInputLstmPolicy).
+    Beobachtungen:
+      1) Segmentierte Kamera: shape = (IMG_HEIGHT, IMG_WIDTH, 3)
+      2) Array mit Werten:
+         [dist_center, gps_waypoint_x, gps_waypoint_y, gps_ego_x, gps_ego_y, speed]
+
+    Aktionen (kontinuierlich):
+      - Gas (Throttle)  in [0.0,  0.5]
+      - Lenken (Steering) in [-0.5, 0.5]
+
+    Rewards (Beispielhaft):
+      - +1 max für perfekte Spurhaltung
+      -  negative Belohnung je größer Abweichung von Fahrbahnmitte
+      -  Heading/Speed-Strafe, wenn zu langsam oder im falschen Winkel
+      -  Kollision => Terminierung mit -1
+      -  Alle Rewards werden gescaled in [-1,1]
     """
-    height, width = semseg_id_img.shape[:2]
-    colored = np.zeros((height, width, 3), dtype=np.uint8)
-    for class_id, color in SEMSEG_PALETTE.items():
-        colored[semseg_id_img == class_id] = color
-    return colored
 
-####################################################################################
-# 2) Utility for projecting a world location to camera pixel coords
-####################################################################################
-def world_to_camera(world_loc, camera_transform, camera_intrinsic):
-    """
-    Approximate transform from 3D world location to 2D camera coords.
-    Returns (u, v) or None if behind camera.
-    """
-    import numpy as np
+    metadata = {"render_modes": ["human"]}
 
-    # Build inverse of (camera->world)
-    c_yaw = math.radians(camera_transform.rotation.yaw)
-    c_pitch = math.radians(camera_transform.rotation.pitch)
-    c_roll = math.radians(camera_transform.rotation.roll)
+    def __init__(
+        self,
+        host="127.0.0.1",
+        port=2000,
+        img_width=128,
+        img_height=128,
+        seconds_per_episode=30.0,
+        render_pygame=True
+    ):
+        super(CarlaGymEnv, self).__init__()
 
-    R_yaw = np.array([[ math.cos(c_yaw), -math.sin(c_yaw), 0],
-                      [ math.sin(c_yaw),  math.cos(c_yaw), 0],
-                      [             0,               0,   1]])
-    R_pitch = np.array([[ math.cos(c_pitch), 0, math.sin(c_pitch)],
-                        [                0,   1,               0],
-                        [-math.sin(c_pitch), 0, math.cos(c_pitch)]])
-    R_roll = np.array([[1,              0,               0],
-                       [0, math.cos(c_roll), -math.sin(c_roll)],
-                       [0, math.sin(c_roll),  math.cos(c_roll)]])
-    R = R_roll @ R_pitch @ R_yaw
+        self.host = host
+        self.port = port
+        self.client = None
+        self.world = None
+        self.vehicle = None
 
-    t = np.array([camera_transform.location.x,
-                  camera_transform.location.y,
-                  camera_transform.location.z])
+        # Bilddimensionen
+        self.IMG_WIDTH = img_width
+        self.IMG_HEIGHT = img_height
 
-    R_inv = R.T
-    t_inv = -R_inv @ t
-    transform_mat = np.eye(4)
-    transform_mat[0:3, 0:3] = R_inv
-    transform_mat[0:3, 3]   = t_inv
+        # Wie lange ein Episode dauern darf
+        self.seconds_per_episode = seconds_per_episode
 
-    # Convert the world_loc (carla.Location) to a homogeneous vector
-    world_point = np.array([world_loc.x, world_loc.y, world_loc.z, 1])
-    cam_coords = transform_mat @ world_point
+        # Sensor-Handler
+        self.camera_sensor = None
+        self.front_camera = None  # wird Numpy-Array (H, W, 3) sein
+        self.collision_sensor = None
 
-    if cam_coords[2] <= 0.01:
-        return None
+        # Pygame-Rendering einschalten?
+        self.render_pygame = render_pygame
+        self._pygame_initialized = False
 
-    # Project
-    px = (camera_intrinsic[0, 0] * (cam_coords[0] / cam_coords[2])) + camera_intrinsic[0, 2]
-    py = (camera_intrinsic[1, 1] * (cam_coords[1] / cam_coords[2])) + camera_intrinsic[1, 2]
-    return (int(px), int(py))
+        # Pygame-Fenster
+        if self.render_pygame:
+            pygame.init()
+            self.display = pygame.display.set_mode((self.IMG_WIDTH, self.IMG_HEIGHT))
+            pygame.display.set_caption("CARLA Semantic Segmentation")
+            self._pygame_initialized = True
 
-####################################################################################
-# 3) The CARLA Environment with Multi-Input observation and PyGame Render
-####################################################################################
-class CarlaMultiInputEnv(gym.Env):
-    def __init__(self, config):
-        super().__init__()
-        self.host = config.get("host", "localhost")
-        self.port = config.get("port", 2000)
-        self.timeout = config.get("timeout", 10.0)
-        self.synchronous_mode = config.get("synchronous_mode", True)
-
-        self.img_width  = config.get("img_width",  84)
-        self.img_height = config.get("img_height", 84)
-        self.max_episode_steps = 2500
-        self.episode_step = 0
-
-        # Connect to CARLA
-        self.client = carla.Client(self.host, self.port)
-        self.client.set_timeout(self.timeout)
-        self.world = self.client.get_world()
-        self.map   = self.world.get_map()
-
-        if self.synchronous_mode:
-            settings = self.world.get_settings()
-            settings.fixed_delta_seconds = 0.05
-            settings.synchronous_mode = True
-            self.world.apply_settings(settings)
-
-        self.bp_lib = self.world.get_blueprint_library()
-
-        # Action space: [steer, throttle]
-        self.action_space = spaces.Box(
-            low=np.array([-0.5, 0.0], dtype=np.float32),
-            high=np.array([0.5,  0.5], dtype=np.float32),
-            shape=(2,),
+        # Observation Space:
+        #   1) Kamerabild: Box(0, 255, shape=(H,W,3))
+        #   2) Array dist_center, gps_wp_x, gps_wp_y, gps_ego_x, gps_ego_y, speed
+        #      => z.B. 6 floats, wir schätzen Bereiche hier nur grob ab.
+        camera_space = spaces.Box(low=0, high=255, shape=(self.IMG_HEIGHT, self.IMG_WIDTH, 3), dtype=np.uint8)
+        state_space = spaces.Box(
+            low=np.array([-10.0, -1e5, -1e5, -1e5, -1e5, 0.0]),
+            high=np.array([10.0, 1e5, 1e5, 1e5, 1e5, 300.0]),
             dtype=np.float32
         )
 
-        # Observation space: Dict{"image":(3,H,W), "vector":(7,)}
-        self.observation_space = spaces.Dict({
-            "image": spaces.Box(
-                low=0, high=255,
-                shape=(3, self.img_height, self.img_width),
-                dtype=np.uint8
-            ),
-            "vector": spaces.Box(
-                low=-1e5, high=1e5,
-                shape=(7,),
-                dtype=np.float32
-            )
-        })
+        # Für MultiInputLstmPolicy brauchen wir ein Dictionary
+        self.observation_space = spaces.Dict(
+            {
+                "camera": camera_space,
+                "state": state_space,
+            }
+        )
 
-        # Actors & sensors
-        self.vehicle = None
-        self.collision_sensor = None
-        self.camera_sensor = None
-        self.collision_hist = []
-        self.front_image = np.zeros((3, self.img_height, self.img_width), dtype=np.uint8)
-        self.camera_transform = None
+        # Action Space:
+        #   Throttle in [0, 0.5]
+        #   Steering in [-0.5, 0.5]
+        # => Box(low=[0.0, -0.5], high=[0.5, 0.5])
+        self.action_space = spaces.Box(
+            low=np.array([0.0, -0.5], dtype=np.float32),
+            high=np.array([0.5, 0.5], dtype=np.float32),
+        )
 
-        # PyGame
-        self.use_render = config.get("use_render", True)
-        self.screen = None
-        self.clock  = None
-        self.font   = None
+        # Kollisions-Historie
+        self.collision_history = []
 
-        # Build approximate pinhole intrinsic
-        self.intrinsic = self._build_intrinsic()
+        # Episode-Start-Time
+        self.episode_start_time = None
 
-    def _build_intrinsic(self):
-        import numpy as np
-        f_x = self.img_width / (2.0 * math.tan(math.radians(90.0)/2.0))
-        f_y = f_x
-        c_x = self.img_width / 2.0
-        c_y = self.img_height / 2.0
-        K = np.array([
-            [f_x,   0,    c_x],
-            [ 0,    f_y,  c_y],
-            [ 0,    0,     1 ]
-        ])
-        return K
+        # Wegpunkt-Infos
+        self.map = None
+        self.current_waypoint = None
+        self.next_waypoint = None
+
+        # Zufallsgenerator für gym
+        self.seed()
+
+    def seed(self, seed=None):
+        self.np_random, seed = seeding.np_random(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        return [seed]
 
     def reset(self):
-        self._destroy_actors()
-        self.collision_hist.clear()
-        self.episode_step = 0
+        """
+        Reset-Methode: verbindet mit CARLA, erstellt Welt und Fahrzeug neu.
+        Wählt Spawn-Point, setzt Sensoren etc.
+        """
+        # Falls schon einmal Welt/Vehicle vorhanden -> zerstören
+        self._cleanup_actors()
 
-        # Spawn vehicle
+        # Client/Welt initialisieren
+        if self.client is None:
+            self.client = carla.Client(self.host, self.port)
+            self.client.set_timeout(10.0)
+
+        self.world = self.client.get_world()
+        self.map = self.world.get_map()
+
+        # Zufälligen Spawn-Punkt
         spawn_points = self.map.get_spawn_points()
-        if not spawn_points:
-            raise ValueError("No spawn points in map!")
-        spawn_pt = random.choice(spawn_points)
-        bp = self.bp_lib.find('vehicle.tesla.model3')
-        self.vehicle = None
-        for _ in range(10):
-            actor = self.world.try_spawn_actor(bp, spawn_pt)
-            if actor:
-                self.vehicle = actor
-                break
-        if not self.vehicle:
-            raise ValueError("Couldn't spawn vehicle after multiple attempts.")
+        spawn_point = random.choice(spawn_points)
 
-        # Collision sensor
-        col_bp = self.bp_lib.find('sensor.other.collision')
+        blueprint_library = self.world.get_blueprint_library()
+        vehicle_bp = blueprint_library.filter("model3")[0]  # z.B. Tesla Model 3
+        self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
+        if self.vehicle is None:
+            # Falls besetzt -> nochmal probieren (minimaler Fallback)
+            for _ in range(10):
+                spawn_point = random.choice(spawn_points)
+                self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
+                if self.vehicle is not None:
+                    break
+            if self.vehicle is None:
+                raise RuntimeError("Fahrzeug konnte nicht gespawnt werden.")
+
+        # Kamera-Blueprint (Semantic Segmentation)
+        seg_cam_bp = blueprint_library.find("sensor.camera.semantic_segmentation")
+        seg_cam_bp.set_attribute("image_size_x", str(self.IMG_WIDTH))
+        seg_cam_bp.set_attribute("image_size_y", str(self.IMG_HEIGHT))
+        seg_cam_bp.set_attribute("fov", "100")
+
+        # Kamera am Fahrzeug anbringen
+        cam_transform = carla.Transform(carla.Location(x=1.5, z=2.4))  # leicht über dem Auto
+        self.camera_sensor = self.world.spawn_actor(seg_cam_bp, cam_transform, attach_to=self.vehicle)
+
+        # Callback registrieren
+        self.camera_sensor.listen(lambda image: self._on_camera_image(image))
+
+        # Collision Sensor
+        col_bp = blueprint_library.find("sensor.other.collision")
         self.collision_sensor = self.world.spawn_actor(col_bp, carla.Transform(), attach_to=self.vehicle)
-        self.collision_sensor.listen(lambda e: self._on_collision(e))
+        self.collision_sensor.listen(lambda event: self._on_collision(event))
 
-        # Semantic seg camera
-        cam_bp = self.bp_lib.find('sensor.camera.semantic_segmentation')
-        cam_bp.set_attribute("image_size_x", f"{self.img_width}")
-        cam_bp.set_attribute("image_size_y", f"{self.img_height}")
-        cam_bp.set_attribute("fov", "90")
-        cam_tf = carla.Transform(carla.Location(x=1.6, z=2.0))
-        self.camera_sensor = self.world.spawn_actor(cam_bp, cam_tf, attach_to=self.vehicle)
-        self.camera_sensor.listen(lambda img: self._process_camera(img))
+        # Kollisions-Historie leeren
+        self.collision_history = []
 
-        self.camera_transform = self.camera_sensor.get_transform()
+        # Fahrzeug "anfahren"
+        self.vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
 
-        # Let simulation stabilize
-        for _ in range(20):
-            if self.synchronous_mode:
-                self.world.tick()
-            else:
-                self.world.wait_for_tick()
+        # Wegpunkt-Initialisierung
+        self.current_waypoint = self.map.get_waypoint(self.vehicle.get_location())
+        self.next_waypoint = self._get_random_next_waypoint(self.current_waypoint)
 
-        if self.use_render and self.screen is None:
-            pygame.init()
-            pygame.font.init()
-            self.screen = pygame.display.set_mode((800,600))
-            self.clock = pygame.time.Clock()
-            self.font  = pygame.font.SysFont("Arial", 20)
+        # Startzeit der Episode
+        self.episode_start_time = time.time()
 
-        return self._get_obs()
+        # Warten, bis erstes Kamerabild da ist
+        self.front_camera = None
+        start_wait = time.time()
+        while self.front_camera is None:
+            time.sleep(0.01)
+            if time.time() - start_wait > 5.0:
+                break
+
+        # Beobachtung zurückgeben
+        obs = self._get_observation()
+        return obs
 
     def step(self, action):
-        self.episode_step += 1
-        steer, throttle = action
-        control = carla.VehicleControl(
-            steer=float(steer),
-            throttle=float(throttle),
-            brake=0.0
-        )
+        """
+        Step-Funktion: Führe Aktion aus, berechne Reward, prüfe Termination.
+        action = [throttle, steer]
+        """
+        throttle, steer = float(action[0]), float(action[1])
+
+        # Kontrolle ans Fahrzeug senden
+        control = carla.VehicleControl()
+        control.throttle = max(0.0, min(0.5, throttle))  # clip
+        control.steer = max(-0.5, min(0.5, steer))       # clip
+        control.brake = 0.0
         self.vehicle.apply_control(control)
 
-        if self.synchronous_mode:
-            self.world.tick()
-        else:
-            self.world.wait_for_tick()
+        # Geschw./Position/Abstand usw. berechnen
+        distance_to_center, heading_error = self._calc_lane_center_data()
 
-        obs = self._get_obs()
-        reward, done = self._compute_reward_done()
+        # Reward design (vereinfacht):
+        # 1) Spurhaltung: Je näher an der Mitte, desto besser
+        # 2) Heading/Speed-Strafe
+        # 3) Collision = done + -1
+        # 4) minimaler Reward = -1, maximaler Reward = +1
+
+        done = False
+        reward = 0.0
+
+        # Kollision?
+        if len(self.collision_history) > 0:
+            done = True
+            reward = -1.0
+
+        # Distance zur Mitte => normalisieren und belohnen
+        # Hier z.B. lineare Abnahme. Distanz > 2.0 => starker Malus
+        dist_penalty = min(abs(distance_to_center) / 2.0, 1.0)
+        reward_center = 1.0 - dist_penalty  # [0..1]
+        reward += 0.5 * reward_center  # Wichtung
+
+        # Geschwindigkeit
+        speed = self._get_speed()
+        if speed < 0.1:
+            # steht quasi -> Malus
+            reward -= 0.3
+
+        # Heading-Error: stark vereinfacht
+        # Hier z.B. |heading_error| > 25 Grad => Malus
+        if abs(heading_error) > 25.0:
+            reward -= 0.2
+
+        # Reward begrenzen
+        reward = float(np.clip(reward, -1.0, 1.0))
+
+        # Timeout => done
+        if (time.time() - self.episode_start_time) > self.seconds_per_episode:
+            done = True
+
+        # Prüfen, ob Waypoint "hinter" uns liegt => neu spawnen
+        if not self._waypoint_ahead_of_vehicle(self.next_waypoint):
+            # Alle Vehicles löschen (bspw. NPCs)
+            self._remove_all_vehicles()
+            # Neues Spawn
+            self.reset()
+            done = True
+            reward -= 0.3  # kleiner Malus, da wir "gescheitert" sind
+
+        # Random Entscheidung an Kreuzungen
+        if self.next_waypoint.is_intersection:
+            # z.B. 1/3 gerade, 1/3 rechts, 1/3 links
+            r = random.random()
+            if r < 0.33:
+                self.next_waypoint = self.next_waypoint.next_until_lane_end(1)[0]
+            elif r < 0.66:
+                self.next_waypoint = self.next_waypoint.get_right_lane()
+            else:
+                self.next_waypoint = self.next_waypoint.get_left_lane()
+        else:
+            # Normal weiter
+            self.next_waypoint = self._get_random_next_waypoint(self.next_waypoint)
+
+        obs = self._get_observation()
 
         return obs, reward, done, {}
 
-    def render(self, mode='human'):
+    def render(self, mode="human"):
         """
-        Must be called repeatedly to keep the PyGame window responsive.
+        Optionales Rendering via Pygame.
         """
-        if not self.use_render or self.screen is None:
+        if not self.render_pygame or not self._pygame_initialized:
             return
 
-        # Process PyGame events
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit()
-                sys.exit()
-
-        # Convert self.front_image (3,H,W)->(H,W,3)
-        img = np.transpose(self.front_image, (1,2,0))
-        surf = pygame.surfarray.make_surface(img)
-        # Scale to bigger
-        camera_surf = pygame.transform.scale(surf, (400,400))
-
-        self.screen.fill((0,0,0))
-        self.screen.blit(camera_surf, (0,0))
-
-        # Show text info
-        vec_obs = self._get_vector_obs()
-        nx, ny, cx, cy, speed, lane_off, heading_err = vec_obs
-        lines = [
-            f"Step: {self.episode_step}/{self.max_episode_steps}",
-            f"Speed: {speed:.2f} m/s",
-            f"Lane Off: {lane_off:.2f}",
-            f"Heading Err: {heading_err:.2f}",
-            f"Pos: ({cx:.1f}, {cy:.1f})",
-            f"NextWP: ({nx:.1f}, {ny:.1f})"
-        ]
-        x_text, y_text = 420, 10
-        for line in lines:
-            text_surf = self.font.render(line, True, (255,255,255))
-            self.screen.blit(text_surf, (x_text,y_text))
-            y_text += 25
-
-        # Draw a dot for the next waypoint if in front
-        from carla import Location
-        waypoint_loc = Location(x=nx, y=ny, z=0.0)
-        dot = world_to_camera(waypoint_loc, self.camera_transform, self.intrinsic)
-        if dot:
-            px, py = dot
-            # scale to the 400x400 display
-            scale_x = 400 / self.img_width
-            scale_y = 400 / self.img_height
-            dx, dy = int(px*scale_x), int(py*scale_y)
-            if 0 <= dx < 400 and 0 <= dy < 400:
-                pygame.draw.circle(camera_surf, (255,0,0), (dx,dy), 5)
-        self.screen.blit(camera_surf, (0,0))
-
+        if self.front_camera is not None:
+            surface = pygame.surfarray.make_surface(self.front_camera.swapaxes(0, 1))
+            self.display.blit(surface, (0, 0))
         pygame.display.flip()
-        self.clock.tick(30)
-
-    # --------------------- Internals ---------------------
-    def _on_collision(self, event):
-        impulse = event.normal_impulse
-        intensity = math.sqrt(impulse.x**2 + impulse.y**2 + impulse.z**2)
-        self.collision_hist.append(intensity)
-
-    def _process_camera(self, image):
-        import numpy as np
-        array = np.frombuffer(image.raw_data, dtype=np.uint8)
-        array = array.reshape((image.height, image.width, 4))
-        sem_id = array[:,:,2]  # semantic class ID
-        colored = apply_semseg_palette(sem_id)
-        # shape (H,W,3), then transpose to (3,H,W)
-        colored_t = np.transpose(colored, (2,0,1))
-        self.front_image = colored_t
-        if self.camera_sensor:
-            self.camera_transform = self.camera_sensor.get_transform()
-
-    def _compute_reward_done(self):
-        done = False
-        if len(self.collision_hist) > 0:
-            return -30.0, True
-        if self.episode_step >= self.max_episode_steps:
-            done = True
-
-        # Basic shaping: speed near 10 m/s, minimal lane offset/heading error
-        vec = self._get_vector_obs()
-        _, _, _, _, speed, lane_off, heading_err = vec
-        target_speed = 10.0
-        heading_pen  = -0.1*abs(heading_err)
-        offset_pen   = -0.05*abs(lane_off)
-        speed_pen    = -0.01*abs(speed - target_speed)
-        step_reward  = heading_pen + offset_pen + speed_pen
-        step_reward  = float(np.clip(step_reward, -1, 1))
-        return step_reward, done
-
-    def _get_obs(self):
-        return {
-            "image": self.front_image,
-            "vector": self._get_vector_obs()
-        }
-
-    def _get_vector_obs(self):
-        tf = self.vehicle.get_transform()
-        vx, vy = tf.location.x, tf.location.y
-        vel = self.vehicle.get_velocity()
-        speed = math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
-        off, hed = self._lane_center_offset_and_heading(tf)
-
-        # Next WP 5m ahead
-        wp = self.map.get_waypoint(tf.location, project_to_road=True)
-        if wp:
-            nxts = wp.next(5.0)
-            if len(nxts)>0:
-                nx, ny = nxts[0].transform.location.x, nxts[0].transform.location.y
-            else:
-                nx, ny = vx, vy
-        else:
-            nx, ny = vx, vy
-
-        return np.array([nx, ny, vx, vy, speed, off, hed], dtype=np.float32)
-
-    def _lane_center_offset_and_heading(self, vehicle_transform):
-        wp = self.map.get_waypoint(vehicle_transform.location, project_to_road=True, lane_type=carla.LaneType.Driving)
-        if not wp:
-            return 0.0, 0.0
-        lane_tf = wp.transform
-        vx, vy = vehicle_transform.location.x, vehicle_transform.location.y
-        vehicle_yaw = math.radians(vehicle_transform.rotation.yaw)
-        lx, ly = lane_tf.location.x, lane_tf.location.y
-        lane_yaw = math.radians(lane_tf.rotation.yaw)
-
-        rvec = lane_tf.get_right_vector()
-        dx, dy = vx-lx, vy-ly
-        lane_off  = dx*rvec.x + dy*rvec.y
-
-        hed_err = vehicle_yaw - lane_yaw
-        hed_err = (hed_err + math.pi) % (2*math.pi) - math.pi
-        return lane_off, hed_err
-
-    def _destroy_actors(self):
-        if self.collision_sensor:
-            self.collision_sensor.destroy()
-            self.collision_sensor = None
-        if self.camera_sensor:
-            self.camera_sensor.destroy()
-            self.camera_sensor = None
-        if self.vehicle:
-            self.vehicle.destroy()
-            self.vehicle = None
 
     def close(self):
-        self._destroy_actors()
-        if self.synchronous_mode:
-            s = self.world.get_settings()
-            s.synchronous_mode = False
-            s.fixed_delta_seconds = None
-            self.world.apply_settings(s)
-        if self.screen:
+        """
+        Aufräumen.
+        """
+        self._cleanup_actors()
+        if self._pygame_initialized:
             pygame.quit()
-            self.screen = None
-            self.clock = None
-            self.font  = None
+        self.client = None
+
+    #########################
+    # Hilfsfunktionen
+    #########################
+
+    def _on_camera_image(self, image):
+        """
+        Callback für Kamera-Bild (Semantic Segmentation).
+        Konvertieren in ein RGB-Array, in self.front_camera speichern.
+        """
+        # image: carla.Image => BGRA
+        array = np.frombuffer(image.raw_data, dtype=np.uint8)
+        array = array.reshape((image.height, image.width, 4))
+        # Die semantische Segmentierung liegt in 'G' (grüner Kanal) oder als 'class'-Index
+        # Der Einfachheit halber tun wir so, als wäre es schon ein "farbiges" Labelbild.
+        # Man kann hier eine eigene Farbpalette anwenden. Demo:
+        rgb = array[:, :, :3]
+        self.front_camera = rgb
+
+    def _on_collision(self, event):
+        """
+        Callback für Kollisionen.
+        """
+        impulse = event.normal_impulse
+        intensity = math.sqrt(impulse.x**2 + impulse.y**2 + impulse.z**2)
+        # Wenn Intensität > Schwellwert => Kollision merken
+        if intensity > 500:  # Threshold anpassen
+            self.collision_history.append(event)
+
+    def _get_speed(self):
+        """
+        Liefert Geschwindigkeit (km/h).
+        """
+        vel = self.vehicle.get_velocity()
+        speed = 3.6 * math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
+        return speed
+
+    def _calc_lane_center_data(self):
+        """
+        Berechnet:
+          - Distance zur Fahrbahnmitte (positiv/negativ je nach Seite, stark vereinfacht)
+          - Heading-Fehler (in Grad)
+        """
+        waypoint = self.map.get_waypoint(self.vehicle.get_location(), project_to_road=True)
+        if waypoint is None:
+            return 0.0, 0.0
+
+        # Distanz zur Center-Linie
+        loc = self.vehicle.get_location()
+        wp_loc = waypoint.transform.location
+        vec_wp2veh = np.array([loc.x - wp_loc.x, loc.y - wp_loc.y])
+        # Quer-/Normalenrichtung
+        forward = waypoint.transform.get_forward_vector()
+        # normal vector (perp):
+        #  forward (fx, fy), normal ~ (fy, -fx)
+        fx, fy = forward.x, forward.y
+        perp = np.array([fy, -fx])
+        dist_center = np.dot(vec_wp2veh, perp)
+
+        # Heading Error
+        veh_yaw = self.vehicle.get_transform().rotation.yaw
+        wp_yaw = waypoint.transform.rotation.yaw
+        heading_error = wp_yaw - veh_yaw
+        heading_error = (heading_error + 180) % 360 - 180  # in [-180, 180]
+
+        return dist_center, heading_error
+
+    def _get_observation(self):
+        """
+        Fasst das Dict für MultiInputLstmPolicy zusammen.
+         {
+           'camera': np.array(H,W,3),
+           'state': np.array([dist_center, gps_wp_x, gps_wp_y, ego_x, ego_y, speed])
+         }
+        """
+        dist_center, _ = self._calc_lane_center_data()
+        speed = self._get_speed()
+
+        # next_waypoint Koordinaten
+        if self.next_waypoint is not None:
+            wp_loc = self.next_waypoint.transform.location
+            gps_wp_x, gps_wp_y = wp_loc.x, wp_loc.y
+        else:
+            gps_wp_x, gps_wp_y = 0.0, 0.0
+
+        # eigene Position
+        loc = self.vehicle.get_location()
+        ego_x, ego_y = loc.x, loc.y
+
+        # Numerischer State
+        state_array = np.array([dist_center, gps_wp_x, gps_wp_y, ego_x, ego_y, speed], dtype=np.float32)
+
+        # Kamera
+        if self.front_camera is None:
+            # Platzhalter-Bild, falls noch nichts da
+            camera_image = np.zeros((self.IMG_HEIGHT, self.IMG_WIDTH, 3), dtype=np.uint8)
+        else:
+            camera_image = self.front_camera
+
+        return {
+            "camera": camera_image,
+            "state": state_array
+        }
+
+    def _get_random_next_waypoint(self, current_wp):
+        """
+        Hilfsfunktion: Nimmt aktuelles Waypoint und gibt
+        eines der möglichen "next()" zurück.
+        """
+        if current_wp is None:
+            return None
+        next_wps = current_wp.next(2.0)  # 2 Meter weiter
+        if len(next_wps) == 0:
+            return None
+        return random.choice(next_wps)
+
+    def _waypoint_ahead_of_vehicle(self, waypoint):
+        """
+        Prüft grob, ob das gegebene Waypoint noch vor dem Fahrzeug liegt,
+        oder ob wir es bereits 'passiert' haben.
+        Eine einfache Methode ist, den Vektor (vehicle->waypoint)
+        mit der Vorwärtsrichtung des Fahrzeugs zu vergleichen.
+        Liegt der Winkel > 90°, ist das Waypoint 'hinter' uns.
+        """
+        if waypoint is None:
+            return True
+
+        vehicle_transform = self.vehicle.get_transform()
+        forward_vec = vehicle_transform.get_forward_vector()
+        veh_loc = vehicle_transform.location
+        wp_loc = waypoint.transform.location
+
+        to_wp = carla.Vector3D(wp_loc.x - veh_loc.x, wp_loc.y - veh_loc.y, 0.0)
+        dot = forward_vec.x * to_wp.x + forward_vec.y * to_wp.y
+
+        # Ist das Skalarprodukt < 0 => > 90° => hinter uns
+        return dot > 0.0
+
+    def _remove_all_vehicles(self):
+        """
+        Beispielhafter Reset: Löscht alle NPC-Fahrzeuge (außer unser eigenes),
+        kann z.B. aufgerufen werden, wenn das Waypoint hinter uns liegt.
+        """
+        all_actors = self.world.get_actors()
+        vehicles = all_actors.filter("*vehicle*")
+        for v in vehicles:
+            if v.id != self.vehicle.id:
+                v.destroy()
+
+    def _cleanup_actors(self):
+        """
+        Entfernt Vehicle, Sensoren etc., falls sie noch existieren.
+        """
+        if self.collision_sensor is not None:
+            self.collision_sensor.stop()
+            if self.collision_sensor.is_alive:
+                self.collision_sensor.destroy()
+            self.collision_sensor = None
+
+        if self.camera_sensor is not None:
+            self.camera_sensor.stop()
+            if self.camera_sensor.is_alive:
+                self.camera_sensor.destroy()
+            self.camera_sensor = None
+
+        if self.vehicle is not None:
+            if self.vehicle.is_alive:
+                self.vehicle.destroy()
+            self.vehicle = None
 
 
-####################################################################################
-# 4) Main: Train and Test with Render
-####################################################################################
-def main():
-    config = {
-        "host": "localhost",
-        "port": 2000,
-        "timeout": 10.0,
-        "synchronous_mode": True,
-        "img_width":  84,
-        "img_height": 84,
-        "use_render": False  # Turn off rendering during training to avoid slowdowns
-    }
-
-    # Vectorized env for training
-    def make_env():
-        return CarlaMultiInputEnv(config)
-    env = DummyVecEnv([make_env])
-
-    # Another env for evaluation
-    eval_env = DummyVecEnv([make_env])
-
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path="./logs_multiinput_lstm/",
-        log_path="./logs_multiinput_lstm/",
-        eval_freq=50000,
-        deterministic=True,
-        render=False
-    )
-
-    model = RecurrentPPO(
-        policy=MultiInputLstmPolicy,
-        env=env,
-        n_steps=128,
-        batch_size=64,
-        gamma=0.99,
-        gae_lambda=0.95,
-        n_epochs=10,
-        ent_coef=0.0,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        clip_range=0.2,
-        verbose=1,
-        tensorboard_log="./multiinput_lstm_tensorboard/",
-        policy_kwargs=dict(
-            n_lstm_layers=2,
-            lstm_hidden_size=512,
-            net_arch=[dict(pi=[512,512,512], vf=[512,512,512])],
-            cnn_extractor_kwargs=dict(features_dim=512),
-        )
-    )
-
-    # -------------- Train (no rendering) ---------------
-    model.learn(total_timesteps=200000, callback=eval_callback)
-    model.save("multiinput_cnn_lstm_carla_pygame")
-    print("Training complete!")
-
-    # -------------- Test with rendering ---------------
-    # We'll create a new env that has use_render=True
-    config["use_render"] = True
-    test_env = CarlaMultiInputEnv(config)
-
-    obs = test_env.reset()
-    lstm_states = None
-    episode_starts = np.ones((1,), dtype=bool)
-
-    for _ in range(1000):
-        # Let the model decide
-        action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts, deterministic=True)
-        
-        # Step
-        obs, reward, done, info = test_env.step(action[0])
-        
-        # Render
-        test_env.render()  # <= IMPORTANT, must be called repeatedly
-        
-        episode_starts = done
-        if done:
-            print("Episode done! Reward:", reward)
-            obs = test_env.reset()
-            lstm_states = None
-            episode_starts = np.ones((1,), dtype=bool)
-
-    test_env.close()
-
+#########################
+# Beispiel für SB3-Training
+#########################
 
 if __name__ == "__main__":
-    main()
+    """
+    Kleines Test-Skript, startet die Umgebung und macht ein paar Random-Steps.
+    Zur Integration in SB3 etwa:
+
+        from stable_baselines3 import PPO
+        from stable_baselines3.common.env_checker import check_env
+        from stable_baselines3.common.vec_env import DummyVecEnv
+
+        env = CarlaGymEnv()
+        check_env(env)  # Prüft, ob das Env-Interface korrekt ist
+
+        # Weil wir Dict-Observation haben, MultiInputLstmPolicy wählen:
+        model = PPO("MultiInputLstmPolicy", env=DummyVecEnv([lambda: env]), verbose=1)
+        model.learn(total_timesteps=100000)
+    """
+
+    env = CarlaGymEnv(render_pygame=True)
+    obs = env.reset()
+
+    for _ in range(20):
+        action = env.action_space.sample()  # random
+        obs, reward, done, info = env.step(action)
+        env.render()
+        print(f"Reward: {reward:.3f}")
+        if done:
+            obs = env.reset()
+
+    env.close()

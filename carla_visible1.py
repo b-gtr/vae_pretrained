@@ -1,10 +1,10 @@
 import gym
-from gym import spaces
 import numpy as np
 import pygame
 import carla
 import math
 import threading
+from gym import spaces
 
 class CollisionSensor:
     def __init__(self, vehicle, blueprint_library, world):
@@ -17,7 +17,25 @@ class CollisionSensor:
         self.sensor.listen(lambda event: self.history.append(event))
 
     def destroy(self):
-        if self.sensor is not None:
+        if self.sensor:
+            self.sensor.destroy()
+
+    def get_history(self):
+        return self.history
+
+
+class LaneInvasionSensor:
+    def __init__(self, vehicle, blueprint_library, world):
+        self.vehicle = vehicle
+        lane_invasion_bp = blueprint_library.find('sensor.other.lane_invasion')
+        self.sensor = world.spawn_actor(lane_invasion_bp, carla.Transform(), attach_to=self.vehicle)
+        self.history = []
+
+    def listen(self):
+        self.sensor.listen(lambda event: self.history.append(event))
+
+    def destroy(self):
+        if self.sensor:
             self.sensor.destroy()
 
     def get_history(self):
@@ -25,7 +43,7 @@ class CollisionSensor:
 
 
 class CameraSensor:
-    def __init__(self, vehicle, blueprint_library, world, callback):
+    def __init__(self, vehicle, blueprint_library, world, image_callback):
         self.vehicle = vehicle
         camera_bp = blueprint_library.find('sensor.camera.semantic_segmentation')
         camera_bp.set_attribute('image_size_x', '640')
@@ -33,27 +51,35 @@ class CameraSensor:
         camera_bp.set_attribute('fov', '110')
         transform = carla.Transform(carla.Location(x=1.5, z=2.4))
         self.sensor = world.spawn_actor(camera_bp, transform, attach_to=vehicle)
-        self.callback = callback
+        self.callback = image_callback
 
     def listen(self):
         self.sensor.listen(self.callback)
 
     def destroy(self):
-        if self.sensor is not None:
+        if self.sensor:
             self.sensor.destroy()
 
 
 class CarlaGymEnv(gym.Env):
     """
-    An environment using a single‐channel semantic‐segmentation camera in (480,640,1).
-    This shape is recognized by SB3's NatureCNN as a grayscale image.
+    CARLA environment returning a semantic segmentation camera image in (480,640,1).
+    The image is stored as uint8 in [0..255].
+
+    We adopt the newer Gym/Gymnasium style, with `render_mode` in the constructor.
+    `render_mode="human"` => PyGame window, "rgb_array" => returns np.array in render().
     """
 
-    def __init__(self, host='localhost', port=2000, display=True):
+    metadata = {
+        "render_modes": ["human", "rgb_array"],
+        "render_fps": 20
+    }
+
+    def __init__(self, host='localhost', port=2000, render_mode=None):
         super().__init__()
         self.host = host
         self.port = port
-        self.display = display
+        self.render_mode = render_mode  # could be None, "human", or "rgb_array"
 
         # Connect to CARLA
         self.client = carla.Client(self.host, self.port)
@@ -71,38 +97,40 @@ class CarlaGymEnv(gym.Env):
 
         self.vehicle = None
         self.collision_sensor = None
+        self.lane_invasion_sensor = None
         self.camera_sensor = None
 
-        # Thread lock to protect camera data
+        # Thread lock for camera data
         self.image_lock = threading.Lock()
-        # We'll store camera data in shape (480, 640, 1).
+        # We'll store the camera data in shape (480,640,1), uint8
         self.agent_image = None
 
-        # PyGame for rendering
-        if self.display:
+        # If user wants a live window: init PyGame
+        if self.render_mode == "human":
             pygame.init()
             self.screen = pygame.display.set_mode((640, 480))
             pygame.display.set_caption("CARLA Semantic Segmentation")
             self.clock = pygame.time.Clock()
+        else:
+            self.screen = None
+            self.clock = None
 
-        # ACTION SPACE: 2D continuous [steer, throttle] in [-1,1]
+        # Action space: [steer, throttle] in [-1,1]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
-        # OBSERVATION SPACE: (480, 640, 1), channel-last
+        # Observation space: single‐channel 8-bit image => [0..255], shape=(480,640,1)
         self.observation_space = spaces.Box(
-            low=0.0,
-            high=1.0,
+            low=0, high=255,
             shape=(480, 640, 1),
-            dtype=np.float32
+            dtype=np.uint8
         )
 
         self.reset()
 
     def _init_actors(self):
-        # Clear old actors if any
         self._clear_actors()
 
-        # Spawn a vehicle
+        # Spawn the vehicle
         vehicle_bp = self.blueprint_library.filter('vehicle.lincoln.mkz_2017')[0]
         spawn_point = np.random.choice(self.spawn_points)
         self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
@@ -111,30 +139,32 @@ class CarlaGymEnv(gym.Env):
         self.collision_sensor = CollisionSensor(self.vehicle, self.blueprint_library, self.world)
         self.collision_sensor.listen()
 
+        # Lane invasion sensor
+        self.lane_invasion_sensor = LaneInvasionSensor(self.vehicle, self.blueprint_library, self.world)
+        self.lane_invasion_sensor.listen()
+
         # Camera sensor
         def camera_callback(image):
-            """
-            Convert CARLA semantic segmentation image to shape (480,640,1) in [0,1].
-            """
+            # Convert semantic segmentation to single‐channel [0..255]
             image.convert(carla.ColorConverter.Raw)
             array = np.frombuffer(image.raw_data, dtype=np.uint8)
             array = array.reshape((image.height, image.width, 4))  # => (480,640,4)
 
-            # Red channel has the semantic labels
-            labels = array[:, :, 2].astype(np.float32)
-            # Normalized to [0,1], 22 is the default max label in Carla
-            labels /= 22.0
+            # The "red" channel has semantic labels in [0..22], multiply => [0..255]
+            labels = array[..., 2].astype(np.float32)
+            labels *= (255.0 / 22.0)
+            labels = np.clip(labels, 0, 255).astype(np.uint8)
 
-            # Expand to channel-last: (480,640) => (480,640,1)
+            # Expand to (480,640,1) for single‐channel last
             labels = np.expand_dims(labels, axis=-1)
 
             with self.image_lock:
-                self.agent_image = labels  # shape (480,640,1)
+                self.agent_image = labels
 
         self.camera_sensor = CameraSensor(self.vehicle, self.blueprint_library, self.world, camera_callback)
         self.camera_sensor.listen()
 
-        # Let the sensors warm up
+        # Let sensors warm up
         for _ in range(10):
             self.world.tick()
 
@@ -145,18 +175,22 @@ class CarlaGymEnv(gym.Env):
         if self.collision_sensor:
             self.collision_sensor.destroy()
             self.collision_sensor = None
+        if self.lane_invasion_sensor:
+            self.lane_invasion_sensor.destroy()
+            self.lane_invasion_sensor = None
         if self.vehicle:
             self.vehicle.destroy()
             self.vehicle = None
         self.agent_image = None
 
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
         self._init_actors()
         return self._get_obs()
 
     def step(self, action):
         steer, throttle = float(action[0]), float(action[1])
-        # Scale throttle from [-1,1] => [0,1]
+        # scale throttle from [-1,1] => [0,1]
         throttle = 0.5 * (throttle + 1.0)
 
         control = carla.VehicleControl()
@@ -171,11 +205,15 @@ class CarlaGymEnv(gym.Env):
         done = False
         info = {}
 
-        # Collision check
+        # Collision penalty
         if len(self.collision_sensor.get_history()) > 0:
             reward -= 50.0
             done = True
             info["collision"] = True
+
+        # Lane invasion penalty
+        if len(self.lane_invasion_sensor.get_history()) > 0:
+            reward -= 10.0
 
         # Speed-based reward
         speed = self.get_vehicle_speed()
@@ -187,28 +225,46 @@ class CarlaGymEnv(gym.Env):
     def _get_obs(self):
         with self.image_lock:
             if self.agent_image is None:
-                return np.zeros((480, 640, 1), dtype=np.float32)
-            else:
-                return self.agent_image.copy()
+                return np.zeros((480, 640, 1), dtype=np.uint8)
+            return self.agent_image.copy()
 
-    def render(self):
-        if not self.display or self.agent_image is None:
-            return
+    def render(self, mode=None):
+        """
+        Called by SB3 or Gym. We accept 'mode' so that we don't get 'unexpected keyword argument' errors.
+        If render_mode == "human" => show PyGame window.
+        If "rgb_array" => return np.array of the frame.
+        """
+        # If no mode is given, default to self.render_mode
+        if mode is None:
+            mode = self.render_mode
 
-        # shape: (480,640,1)
-        gray = (self.agent_image[..., 0] * 255).astype(np.uint8)  # (480,640)
-        rgb = np.stack([gray, gray, gray], axis=-1)  # (480,640,3)
-
-        surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
-        self.screen.blit(surf, (0, 0))
-        pygame.display.flip()
-        self.clock.tick(20)
+        if mode == "human":
+            # Show live PyGame window
+            if self.screen is not None and self.agent_image is not None:
+                # agent_image is (480,640,1); replicate to (480,640,3) for a quick color image
+                gray = self.agent_image[..., 0]
+                rgb = np.stack([gray, gray, gray], axis=-1)
+                surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
+                self.screen.blit(surf, (0, 0))
+                pygame.display.flip()
+                if self.clock:
+                    self.clock.tick(self.metadata["render_fps"])
+            return None
+        elif mode == "rgb_array":
+            # Return the latest frame as an array
+            if self.agent_image is None:
+                return np.zeros((480, 640, 3), dtype=np.uint8)
+            # Convert (480,640,1) => (480,640,3)
+            gray = self.agent_image[..., 0]
+            rgb = np.stack([gray, gray, gray], axis=-1)
+            return rgb
+        else:
+            # mode=None or something else => do nothing
+            return None
 
     def close(self):
-        if self.display:
+        if self.render_mode == "human" and self.screen is not None:
             pygame.quit()
-
-        # restore settings
         self.world.apply_settings(self.original_settings)
         self._clear_actors()
 

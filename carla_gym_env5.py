@@ -56,6 +56,43 @@ def is_waypoint_behind(vehicle_transform, waypoint_transform):
     return dot < 0.0
 
 # ---------------------------------
+# Welt->Bild Projektion (Birdview)
+# ---------------------------------
+def world_to_birdview(world_loc, sensor_transform, image_width, image_height, meters_per_pixel=0.2):
+    """
+    Vereinfachte Projektion von Weltkoordinaten in die Bildkoordinaten (Birdview-Kamera).
+    Annahme: pitch=-90°, yaw=0° => Kamera blickt nach unten. 
+             +X -> rechts, +Y -> "oben" im Bild.
+    Args:
+        world_loc (carla.Location): Weltposition, die projiziert werden soll.
+        sensor_transform (carla.Transform): Position/Rotation der Kamera.
+        image_width (int), image_height (int)
+        meters_per_pixel (float): Skalierung (Zoom) => 0.2 => 1 Pixel = 0.2 m
+    Returns:
+        (u, v) in Bildkoordinaten oder None, wenn es außerhalb liegt.
+    """
+    sx, sy, _sz = sensor_transform.location.x, sensor_transform.location.y, sensor_transform.location.z
+
+    # Kamera ist top-down: 
+    # dx, dy = relative Position in der Horizontalebene
+    dx = world_loc.x - sx
+    dy = world_loc.y - sy
+
+    # +dx => nach rechts, +dy => nach oben (je nach Achsen)
+    u = image_width / 2 + dx / meters_per_pixel
+    v = image_height / 2 - dy / meters_per_pixel
+
+    # Runden auf int
+    u = int(round(u))
+    v = int(round(v))
+
+    # Check Bildgrenzen
+    if 0 <= u < image_width and 0 <= v < image_height:
+        return (u, v)
+    else:
+        return None
+
+# ---------------------------------
 # Sensoren
 # ---------------------------------
 class CollisionSensor:
@@ -76,60 +113,17 @@ class CollisionSensor:
     def get_history(self):
         return self.history
 
-
-# Hilfsfunktion: Projektion von Weltkoordinaten in Bildkoordinaten (Top-Down-Vogelperspektive).
-def world_to_birdview(world_loc, sensor_transform, image_width, image_height, meters_per_pixel=0.2):
-    """
-    Annahmen:
-      - Die Kamera ist top-down: pitch=-90°, so dass X-Welt = +/- rechts, Y-Welt = +/- vorne/hinten,
-        Z = Höhe. 
-      - sensor_transform.location = (sx, sy, sz)
-      - Wir konvertieren die (wx, wy) in relative Koordinaten zur Sensor-Position in der XY-Ebene,
-        dann skalieren wir um in Pixel.
-    Args:
-        world_loc (carla.Location): Weltposition, die projiziert werden soll
-        sensor_transform (carla.Transform): Position/Rotation der Kamera
-        image_width (int), image_height (int)
-        meters_per_pixel (float): Skalierung
-    Returns:
-        (u, v) in Bildkoordinaten oder None, wenn es außerhalb liegt.
-    """
-    sx, sy, sz = sensor_transform.location.x, sensor_transform.location.y, sensor_transform.location.z
-    # Ignoriere Rotation hier vereinfacht, da Kamera pitch=-90, yaw=0: 
-    # => +X in der Welt entspricht +X in Bild, +Y in der Welt => -Y in Bild (je nach Achsen)
-    
-    # relative Koordinaten
-    dx = world_loc.x - sx
-    dy = world_loc.y - sy
-
-    # Da pitch=-90, "oben" ist +z => dx => horizontal, dy => vertikal
-    # Wir nehmen an, +dy in der Welt soll nach "oben" in der Birdview gehen => also v = center - dy
-    # Je nachdem, wie die Achsen orientiert sind, muss man ggf. invertieren.
-    # Hier eine einfache Annahme:
-    u = image_width / 2 + dx / meters_per_pixel
-    v = image_height / 2 - dy / meters_per_pixel
-
-    # Pixel-Koordinaten runden
-    u = int(round(u))
-    v = int(round(v))
-
-    # Check, ob im Bild
-    if 0 <= u < image_width and 0 <= v < image_height:
-        return (u, v)
-    else:
-        return None
-
 class CameraSensor:
     def __init__(self, vehicle, blueprint_library, world, callback):
         self.vehicle = vehicle
         
-        # Semantische Kamera mit Birdview (Top-Down),
+        # Semantische Kamera mit Birdview (Top-Down)
         camera_bp = blueprint_library.find('sensor.camera.semantic_segmentation')
         camera_bp.set_attribute('image_size_x', '640')
         camera_bp.set_attribute('image_size_y', '480')
         camera_bp.set_attribute('fov', '110')
 
-        # Kamera nur 12 m über dem Auto
+        # Kamera nur 12 m über dem Auto => closer birdview
         self.transform = carla.Transform(
             carla.Location(x=0.0, y=0.0, z=12.0),
             carla.Rotation(pitch=-90.0, yaw=0.0, roll=0.0)
@@ -150,8 +144,8 @@ class CameraSensor:
 # ---------------------------------
 class CarlaGymEnv(gym.Env):
     """
-    Environment mit Birdview-Segmentation. Zusätzlich wird im Kamera-Callback
-    der Bereich um den "nächsten Waypoint" (bzw. die 'korrekte Spur') farblich hervorgehoben.
+    Environment mit Birdview-Semantic-Segmentation. 
+    Wir färben die "Ziel-Lane" (basierend auf next_waypoint) weitgehend ein.
     """
     def __init__(self, host='localhost', port=2000, display=True):
         super().__init__()
@@ -229,8 +223,7 @@ class CarlaGymEnv(gym.Env):
         # Kollision
         self.collision_sensor = CollisionSensor(self.vehicle, self.blueprint_library, self.world)
 
-        # Kamera (Birdview semantisch)
-        # Wir definieren hier den Callback mit Extra-Schritt zum Hervorheben:
+        # Kamera-Callback mit nachträglichem Lane-Highlighting
         def camera_callback(image):
             image.convert(carla.ColorConverter.Raw)
             array = np.frombuffer(image.raw_data, dtype=np.uint8)
@@ -238,17 +231,16 @@ class CarlaGymEnv(gym.Env):
 
             # Red-Kanal hat die semantischen Labels von 0..22
             labels = array[:, :, 2].astype(np.float32)
-            # Normalisierung auf [0,1]
-            labels /= 22.0
+            labels /= 22.0  # Normierung auf [0,1]
 
-            # OPTIONAL: Hervorheben des nächsten Waypoints bzw. "korrekte Lane"
-            # Indem wir die Pixel rund um die next_waypoint-Position mit z.B. label=0.8 einfärben:
+            # Kopie erstellen zum Manipulieren
+            labeled_img = labels.copy()
+
+            # Versuchen, die komplette "Zielspur" einzufärben
+            self._highlight_lane(labeled_img)
+
+            labeled_img = np.expand_dims(labeled_img, axis=-1)
             with self.image_lock:
-                # Kopie erstellen, damit wir sie ggf. anpassen können
-                labeled_img = labels.copy()
-                self._highlight_correct_lane(labeled_img)
-                # als (480,640,1) ablegen
-                labeled_img = np.expand_dims(labeled_img, axis=-1)
                 self.camera_image = labeled_img
 
         self.camera_sensor = CameraSensor(
@@ -261,58 +253,6 @@ class CarlaGymEnv(gym.Env):
 
         # "nächsten" Waypoint einmalig setzen
         self._pick_next_waypoint()
-
-    def _highlight_correct_lane(self, labeled_img):
-        """
-        Kleiner Trick: Markiere die Position des "nächsten Waypoints" farblich (z.B. label=0.8).
-        Dabei wird im Birdview ein kleiner Kreis gezeichnet.
-        """
-        if self.next_waypoint is None:
-            return
-        if self.camera_sensor is None:
-            return
-
-        # Bestimme die Bildkoordinate (u,v) des next_waypoints
-        wp_loc = self.next_waypoint.transform.location
-        sensor_transform = self.camera_sensor.sensor.get_transform()
-
-        # Wir nutzen "world_to_birdview" (vereinfachter Ansatz, ohne Rotation),
-        # meters_per_pixel bestimmt den Zoom-Faktor.
-        # Falls das Overlay an falscher Stelle erscheint, muss man
-        # yaw etc. noch genauer berücksichtigen.
-        uv = world_to_birdview(
-            wp_loc, 
-            sensor_transform, 
-            image_width=640, 
-            image_height=480,
-            meters_per_pixel=0.2
-        )
-        if uv is None:
-            return
-        (u, v) = uv
-
-        # Zeichne einen kleinen Kreis (Radius ~ 5 Pixel) mit Wert=0.8:
-        rr = 5
-        for dy in range(-rr, rr+1):
-            for dx in range(-rr, rr+1):
-                xx = u + dx
-                yy = v + dy
-                if 0 <= xx < 640 and 0 <= yy < 480:
-                    # Kreisbedingung
-                    if dx*dx + dy*dy <= rr*rr:
-                        labeled_img[yy, xx] = 0.8  # z.B. 0.8 => eigener "Lane-Highlight"
-
-    def _clear_actors(self):
-        if self.camera_sensor is not None:
-            self.camera_sensor.destroy()
-            self.camera_sensor = None
-        if self.collision_sensor is not None:
-            self.collision_sensor.destroy()
-            self.collision_sensor = None
-        if self.vehicle is not None:
-            self.vehicle.destroy()
-            self.vehicle = None
-        self.camera_image = None
 
     def _pick_next_waypoint(self):
         """Setzt self.next_waypoint auf einen Waypoint in Fahrtrichtung
@@ -337,6 +277,89 @@ class CarlaGymEnv(gym.Env):
         # Bei Kreuzungen liefert next() mehrere Optionen => zufällige Wahl
         self.next_waypoint = random.choice(possible_next)
 
+    def _highlight_lane(self, labeled_img):
+        """
+        Färbt einen längeren Abschnitt der "Ziel-Lane" (basierend auf self.next_waypoint) ein,
+        indem wir Waypoints nach vorne samplen. Dabei setzen wir Pixel => label=0.8.
+        """
+        if not self.next_waypoint or not self.camera_sensor:
+            return
+
+        sensor_tf = self.camera_sensor.sensor.get_transform()
+
+        lane_id = self.next_waypoint.lane_id
+        road_id = self.next_waypoint.road_id
+        lane_width = self.next_waypoint.lane_width
+
+        # Wir samplen ~50m vorwärts in kleinen Schritten
+        step = 2.0
+        max_dist = 50.0
+        current_wp = self.next_waypoint
+        lane_waypoints = []
+        dist_so_far = 0.0
+
+        while dist_so_far < max_dist:
+            if not current_wp:
+                break
+            lane_waypoints.append(current_wp)
+
+            # next() kann mehrere Kandidaten liefern, wir picken den, der
+            # selbe lane_id / road_id hat
+            nxt_list = current_wp.next(step)
+            found_wp = None
+            for cand in nxt_list:
+                if cand.lane_id == lane_id and cand.road_id == road_id:
+                    found_wp = cand
+                    break
+            if found_wp is None:
+                # Lane endet
+                break
+            current_wp = found_wp
+            dist_so_far += step
+
+        # Nun haben wir eine Kette von Waypoints in der "Ziel-Lane".
+        # Quersampling im Bereich [-0.5..+0.5 * lane_width].
+        # Wir markieren ~5 Querlinien pro WP.
+        lateral_samples = np.linspace(-lane_width/2, lane_width/2, num=7)
+
+        for wp in lane_waypoints:
+            base_tf = wp.transform
+            forward_vec = base_tf.get_forward_vector()
+            right_vec = base_tf.get_right_vector()
+
+            base_x = base_tf.location.x
+            base_y = base_tf.location.y
+
+            for lat in lateral_samples:
+                # Pixel in Weltkoordinaten:
+                px = base_x + right_vec.x * lat
+                py = base_y + right_vec.y * lat
+                # Wir geben z=base_tf.location.z, damit world_to_birdview dieselbe Höhe annimmt
+                uv = world_to_birdview(
+                    carla.Location(x=px, y=py, z=base_tf.location.z),
+                    sensor_tf,
+                    image_width=640,
+                    image_height=480,
+                    meters_per_pixel=0.2
+                )
+                if uv is None:
+                    continue
+                (u, v) = uv
+                # Label=0.8 => "leuchtend" in [0..1]
+                labeled_img[v, u] = 0.8
+
+    def _clear_actors(self):
+        if self.camera_sensor is not None:
+            self.camera_sensor.destroy()
+            self.camera_sensor = None
+        if self.collision_sensor is not None:
+            self.collision_sensor.destroy()
+            self.collision_sensor = None
+        if self.vehicle is not None:
+            self.vehicle.destroy()
+            self.vehicle = None
+        self.camera_image = None
+
     def get_vehicle_speed(self):
         """Geschwindigkeit in m/s."""
         if not self.vehicle:
@@ -348,41 +371,26 @@ class CarlaGymEnv(gym.Env):
     # Gym-Methoden
     # ---------------------------------
     def reset(self):
-        """
-        Reset-Methode, die so lange neu spawnt, bis Waypoint NICHT hinter dem Fahrzeug liegt.
-        Dann warten wir 3s (self.wait_steps).
-        """
         self._clear_actors()
         valid_spawn_found = False
         while not valid_spawn_found:
-            # Init (spawnt Fahrzeug + Sensoren und ruft _pick_next_waypoint() auf)
             self._init_vehicle_sensors()
 
             if self.next_waypoint is None:
-                # Safety: Kein Waypoint gefunden => nochmal neu
                 self._clear_actors()
                 continue
 
-            # Check: Liegt der Waypoint hinter dem Fahrzeug?
+            # Check: Waypoint hinterm Fahrzeug?
             if is_waypoint_behind(self.vehicle.get_transform(), self.next_waypoint.transform):
-                print("Spawn ungünstig (Waypoint direkt hinter Fahrzeug). Versuche neuen Spawn...")
+                print("Spawn ungünstig (Waypoint hinter dem Fahrzeug). Neuer Versuch.")
                 self._clear_actors()
             else:
-                # Alles gut
                 valid_spawn_found = True
 
-        # Nach erfolgreichem Spawn: Wartezeit für 3 Sekunden
         self.wait_steps = self.wait_steps_total
-
-        # Geben wir zunächst die Observation zurück
         return self._get_obs()
 
     def step(self, action):
-        """
-        Während self.wait_steps > 0 ignorieren wir das Action-Handling
-        und geben reward=0 zurück (vehicle bleibt stehen).
-        """
-        # 1. Falls wir noch warten: setze Fahrzeugcontrol = 0, verringere wait_steps, reward=0
         if self.wait_steps > 0:
             self.wait_steps -= 1
             control = carla.VehicleControl(steer=0.0, throttle=0.0, brake=1.0)
@@ -390,147 +398,111 @@ class CarlaGymEnv(gym.Env):
 
             self.world.tick()
             obs = self._get_obs()
-            # No reward, not done
             return obs, 0.0, False, {}
 
-        # 2. Normale Aktion ausführen
         steer = float(clamp(action[0], -0.5, 0.5))
         throttle = float(clamp(action[1], -0.5, 0.5))
-        # Skaliere Throttle von -0.5..+0.5 => 0..1
         throttle = (throttle + 0.5)
-        throttle = clamp(throttle, 0.0, 0.5)  # Safety
+        throttle = clamp(throttle, 0.0, 0.5)
 
         control = carla.VehicleControl()
         control.steer = steer
         control.throttle = throttle
         self.vehicle.apply_control(control)
 
-        # Einen Tick simulieren
         self.world.tick()
 
-        # Reward, Done, Info berechnen
         reward, done, info = self._compute_reward_done_info()
 
-        # Lane-Check zum Updaten des Waypoints nur, wenn wir auf richtiger Lane sind
+        # Lane-Update: Nur, wenn wir auf richtiger Lane bleiben etc.
         if not done and self.next_waypoint is not None:
             current_wp = self.map.get_waypoint(
                 self.vehicle.get_transform().location,
                 lane_type=carla.LaneType.Any
             )
-            current_lane_id = current_wp.lane_id
-            target_lane_id = self.next_waypoint.lane_id
-
-            if current_lane_id == target_lane_id and current_wp.lane_type == carla.LaneType.Driving:
-                # Distanz/Hinter-Uns-Logik
+            if (current_wp.lane_id == self.next_waypoint.lane_id
+                and current_wp.lane_type == carla.LaneType.Driving):
                 dist = distance_2d(
                     vector_2d(self.vehicle.get_transform().location),
                     vector_2d(self.next_waypoint.transform.location)
                 )
                 if dist < 2.0:
-                    print(f"Fahrzeug ist nah genug am Waypoint (dist={dist:.2f}). Neuen Waypoint setzen.")
+                    print(f"Fahrzeug nah am Waypoint (dist={dist:.2f}). Neuer Waypoint.")
                     self._pick_next_waypoint()
                 elif is_waypoint_behind(self.vehicle.get_transform(), self.next_waypoint.transform):
-                    print("Waypoint bereits hinter uns (gleiche Lane). Nächsten Waypoint wählen.")
+                    print("Waypoint hinter uns. Neuer Waypoint.")
                     self._pick_next_waypoint()
-            else:
-                # Befindet sich auf einer anderen/falschen Lane oder LaneType != Driving
-                pass
 
         obs = self._get_obs()
         return obs, reward, done, info
 
     def _compute_reward_done_info(self):
-        """Berechnet Reward und Done."""
         info = {}
         done = False
         reward = 0.0
 
-        # 1) Kollision => sofort terminiert + starker Malus
         if len(self.collision_sensor.get_history()) > 0:
-            print(">>> Kollision erkannt, Episode terminiert!")
+            print(">>> Kollision erkannt!")
             reward = -1.0
             done = True
             info["collision"] = True
             return reward, done, info
 
-        # 2) Hole aktuelles Waypoint und prüfe LaneType
         current_wp = self.map.get_waypoint(
             self.vehicle.get_transform().location,
             lane_type=carla.LaneType.Any
         )
         if current_wp.lane_type != carla.LaneType.Driving:
-            print(">>> Fahrzeug auf falscher Lane (z.B. Bordstein/Gehweg). Episode terminiert!")
+            print(">>> Off-Lane (Gehweg/Bordstein)!")
             reward = -1.0
             done = True
             info["off_lane"] = True
             return reward, done, info
 
-        # 3) Prüfe, ob Lane-IDs übereinstimmen. Wenn nicht => negativer Reward
-        lane_id_mismatch = False
-        if self.next_waypoint is not None:
-            if current_wp.lane_id != self.next_waypoint.lane_id:
-                lane_id_mismatch = True
-
-        # 4) Distanz zur Fahrbahnmitte => Reward
-        #    Wir setzen den Threshold hier bewusst etwas kleiner (1.0), damit Ausreißer bestraft werden.
-        lateral_offset = compute_lateral_offset(
-            self.vehicle.get_transform(),
-            current_wp.transform
-        )
-        offset_magnitude = abs(lateral_offset)
-        max_offset = 1.0
-
-        # Wer weiter als 1 m weg ist, kriegt -1 und done.
-        if offset_magnitude >= max_offset:
-            print(">>> Zu weit von Fahrbahnmitte (möglicherweise Bordstein). Episode terminiert!")
-            reward = -1.0
-            done = True
-            info["off_center"] = True
-            return reward, done, info
-
-        # Sonst normaler Spurhaltungsreward
-        if lane_id_mismatch:
-            # Deutliche Strafe
+        # Spurhaltung
+        if self.next_waypoint is not None and current_wp.lane_id != self.next_waypoint.lane_id:
+            # Falsche Lane => starker Negativanteil
             dist_center_reward = -0.5
+            lane_mismatch = True
         else:
-            # linear abnehmend von 0 -> -0.5, offset=0 => +0.5
+            lane_mismatch = False
+            # Distanz zur Mitte:
+            offset_magnitude = abs(compute_lateral_offset(
+                self.vehicle.get_transform(),
+                current_wp.transform
+            ))
+            max_offset = 1.0
+            if offset_magnitude >= max_offset:
+                print(">>> Zu weit von der Mitte => Done!")
+                reward = -1.0
+                done = True
+                info["off_center"] = True
+                return reward, done, info
             dist_center_reward = 0.5 * (1.0 - offset_magnitude / max_offset)
 
-        # 5) Geschwindigkeit (m/s)
+        # Geschwindigkeitsreward
         speed = self.get_vehicle_speed()
         if speed < 0.1:
             speed_reward = -0.3
         else:
             capped_speed = min(speed, 10.0)
-            if lane_id_mismatch:
+            if lane_mismatch:
                 speed_reward = 0.0
             else:
                 speed_reward = 0.5 * (capped_speed / 10.0)
 
         reward = dist_center_reward + speed_reward
-        # clamp auf [-1,1]
         reward = clamp(reward, -1.0, 1.0)
 
         return reward, done, info
 
     def _get_obs(self):
-        """
-        Dictionary-Observation:
-          {
-             "segmentation": (480,640,1),
-             "dist_center": (1,),
-             "gps_next_waypoint": (2,),
-             "gps_own": (2,),
-             "speed": (1,),
-          }
-        """
         with self.image_lock:
             if self.camera_image is None:
                 seg_img = np.zeros((480, 640, 1), dtype=np.float32)
             else:
                 seg_img = self.camera_image.copy()
 
-        # Bild anzeigen (falls display=True)
         if self.display:
             self._show_image(seg_img)
 
@@ -546,21 +518,18 @@ class CarlaGymEnv(gym.Env):
             )
         else:
             lateral_offset = 0.0
-
         dist_center = np.array([lateral_offset], dtype=np.float32)
 
-        # GPS (x,y) Fahrzeug
+        # GPS
         veh_loc = self.vehicle.get_transform().location
         gps_own = np.array([veh_loc.x, veh_loc.y], dtype=np.float32)
 
-        # GPS (x,y) nächster Waypoint
         if self.next_waypoint is None:
-            wp_xy = np.array([0, 0], dtype=np.float32)
+            wp_xy = np.array([0.0, 0.0], dtype=np.float32)
         else:
             wp_loc = self.next_waypoint.transform.location
             wp_xy = np.array([wp_loc.x, wp_loc.y], dtype=np.float32)
 
-        # Speed
         speed = np.array([self.get_vehicle_speed()], dtype=np.float32)
 
         return {
@@ -572,16 +541,11 @@ class CarlaGymEnv(gym.Env):
         }
 
     def _show_image(self, seg_img):
-        """
-        Zeigt das Segmentationsbild per OpenCV-Fenster.
-        seg_img: shape (480,640,1) in [0,1].
-        """
-        gray = (seg_img[..., 0] * 255).astype(np.uint8)  # (480,640)
-        cv2.imshow("CARLA Semantic Segmentation (BirdView, Lane-Highlight)", gray)
+        gray = (seg_img[..., 0] * 255).astype(np.uint8)
+        cv2.imshow("CARLA Semantic Segmentation (Lane Highlight)", gray)
         cv2.waitKey(1)
 
     def render(self, mode="human"):
-        """Nichts extra, da wir _show_image() schon in _get_obs() aufrufen."""
         pass
 
     def close(self):

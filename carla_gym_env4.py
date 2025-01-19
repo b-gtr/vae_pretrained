@@ -81,16 +81,16 @@ class CameraSensor:
     def __init__(self, vehicle, blueprint_library, world, callback):
         self.vehicle = vehicle
         
-        # Semantische Kamera mit Birdview (Top-Down)
+        # Semantische Kamera mit Birdview (Top-Down),
+        # aber deutlich näher (z=12.0 statt 20).
         camera_bp = blueprint_library.find('sensor.camera.semantic_segmentation')
         camera_bp.set_attribute('image_size_x', '640')
         camera_bp.set_attribute('image_size_y', '480')
         camera_bp.set_attribute('fov', '110')
 
         # Hier wird der Transform geändert, damit wir eine Vogelperspektive (Top-Down) haben
-        # pitch=-90 => Kamera schaut senkrecht nach unten
         transform = carla.Transform(
-            carla.Location(x=0.0, y=0.0, z=20.0),
+            carla.Location(x=0.0, y=0.0, z=12.0),  # etwas näher zum Fahrzeug
             carla.Rotation(pitch=-90.0, yaw=0.0, roll=0.0)
         )
 
@@ -392,22 +392,30 @@ class CarlaGymEnv(gym.Env):
                 lane_id_mismatch = True
 
         # 4) Distanz zur Fahrbahnmitte => Reward
+        #    Wir setzen den Threshold hier auf 1.0 statt 2.0, d.h. bei >=1.0 => sofort DONE.
         lateral_offset = compute_lateral_offset(
             self.vehicle.get_transform(),
             current_wp.transform
         )
         offset_magnitude = abs(lateral_offset)
-        max_offset = 2.0
+        max_offset = 1.0  # verschärfter Threshold
 
+        # Wenn das Fahrzeug den Bordstein berührt/weiter als 1m weg -> sofort DONE + Straf-Reward
+        if offset_magnitude >= max_offset:
+            print(">>> Zu weit von Fahrbahnmitte (Bordstein berührt?). Episode terminiert!")
+            reward = -1.0
+            done = True
+            info["off_center"] = True
+            return reward, done, info
+
+        # Sonst normaler Spurhaltungsreward
         if lane_id_mismatch:
             # Deutliche Strafe statt normaler Spurhaltungsbelohnung
             dist_center_reward = -0.5
         else:
-            if offset_magnitude >= max_offset:
-                dist_center_reward = -0.5
-            else:
-                # linear abnehmend von 0 -> -0.5
-                dist_center_reward = 0.5 * (1.0 - offset_magnitude / max_offset)
+            # linear abnehmend von 0 -> -0.5, bei offset=0 => 0.5, offset=1 => 0
+            # (allerdings wissen wir offset<1.0, sonst wären wir oben done)
+            dist_center_reward = 0.5 * (1.0 - offset_magnitude / max_offset)
 
         # 5) Geschwindigkeit (m/s)
         #    Wenn man auf der falschen Lane ist, bitte keinen positiven Speed-Reward

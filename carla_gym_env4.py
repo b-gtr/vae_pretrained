@@ -231,7 +231,9 @@ class CarlaGymEnv(gym.Env):
 
         veh_transform = self.vehicle.get_transform()
         current_wp = self.map.get_waypoint(
-            veh_transform.location, project_to_road=True, lane_type=carla.LaneType.Driving
+            veh_transform.location,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving
         )
         possible_next = current_wp.next(5.0)  # z.B. 5 Meter weiter
 
@@ -285,13 +287,12 @@ class CarlaGymEnv(gym.Env):
 
     def step(self, action):
         """
-        Während self.wait_steps > 0 ignorieren wir das Action-Handling 
-        und geben reward=0 zurück, um die ersten Sekunden zu überspringen.
+        Während self.wait_steps > 0 ignorieren wir das Action-Handling
+        und geben reward=0 zurück (vehicle bleibt stehen).
         """
         # 1. Falls wir noch warten: setze Fahrzeugcontrol = 0, verringere wait_steps, reward=0
         if self.wait_steps > 0:
             self.wait_steps -= 1
-            # Fixes: do minimal control or just do nothing
             control = carla.VehicleControl(steer=0.0, throttle=0.0, brake=1.0)
             self.vehicle.apply_control(control)
 
@@ -303,7 +304,8 @@ class CarlaGymEnv(gym.Env):
         # 2. Normale Aktion ausführen
         steer = float(clamp(action[0], -0.5, 0.5))
         throttle = float(clamp(action[1], -0.5, 0.5))
-        throttle = (throttle + 0.5)  # Scale -0.5..+0.5 => 0..1
+        # Skaliere Throttle von -0.5..+0.5 => 0..1
+        throttle = (throttle + 0.5)
         throttle = clamp(throttle, 0.0, 0.5)  # Safety
 
         control = carla.VehicleControl()
@@ -317,14 +319,17 @@ class CarlaGymEnv(gym.Env):
         # Reward, Done, Info berechnen
         reward, done, info = self._compute_reward_done_info()
 
-        # 3. Nur dann Waypoint wechseln, wenn wir auf der richtigen Lane sind
-        if self.next_waypoint is not None and not done:
-            current_wp = self.map.get_waypoint(self.vehicle.get_transform().location)
+        # Lane-Check zum Updaten des Waypoints nur, wenn wir auf richtiger Lane sind
+        if not done and self.next_waypoint is not None:
+            current_wp = self.map.get_waypoint(
+                self.vehicle.get_transform().location,
+                lane_type=carla.LaneType.Any
+            )
             current_lane_id = current_wp.lane_id
             target_lane_id = self.next_waypoint.lane_id
 
-            # Nur wenn die Lane IDs übereinstimmen, checken wir Distanz/Hinter-Uns-Logik
-            if current_lane_id == target_lane_id:
+            if current_lane_id == target_lane_id and current_wp.lane_type == carla.LaneType.Driving:
+                # Distanz/Hinter-Uns-Logik
                 dist = distance_2d(
                     vector_2d(self.vehicle.get_transform().location),
                     vector_2d(self.next_waypoint.transform.location)
@@ -336,8 +341,9 @@ class CarlaGymEnv(gym.Env):
                     print("Waypoint bereits hinter uns (gleiche Lane). Nächsten Waypoint wählen.")
                     self._pick_next_waypoint()
             else:
-                # Füge einen kleinen Straf-Reward hinzu für falsche Lane
-                reward -= 0.3
+                # Befindet sich auf einer anderen/falschen Lane oder LaneType != Driving
+                # => wir haben in _compute_reward_done_info bereits eine Strafe vergeben
+                pass
 
         obs = self._get_obs()
         return obs, reward, done, info
@@ -348,7 +354,7 @@ class CarlaGymEnv(gym.Env):
         done = False
         reward = 0.0
 
-        # 1) Kollision => sofort terminieren
+        # 1) Kollision => sofort terminiert + starker Malus
         if len(self.collision_sensor.get_history()) > 0:
             print(">>> Kollision erkannt, Episode terminiert!")
             reward = -1.0
@@ -356,29 +362,59 @@ class CarlaGymEnv(gym.Env):
             info["collision"] = True
             return reward, done, info
 
-        # 2) Distanz zur Fahrbahnmitte -> Reward
-        vehicle_wp = self.map.get_waypoint(self.vehicle.get_transform().location)
+        # 2) Hole aktuelles Waypoint und prüfe LaneType
+        current_wp = self.map.get_waypoint(
+            self.vehicle.get_transform().location,
+            lane_type=carla.LaneType.Any
+        )
+
+        # Falls man auf Bordstein, Gehweg o.Ä. gerät => sofortiger Abbruch + starker Malus
+        if current_wp.lane_type != carla.LaneType.Driving:
+            print(">>> Fahrzeug auf falscher Lane (z.B. Bordstein/Gehweg). Episode terminiert!")
+            reward = -1.0
+            done = True
+            info["off_lane"] = True
+            return reward, done, info
+
+        # 3) Prüfe, ob Lane-IDs übereinstimmen. Wenn nicht => negativer Reward
+        #    (Agent ist auf falscher Lane, obwohl lane_type=Driving, z.B. Gegenfahrbahn)
+        lane_id_mismatch = False
+        if self.next_waypoint is not None:
+            if current_wp.lane_id != self.next_waypoint.lane_id:
+                lane_id_mismatch = True
+
+        # 4) Distanz zur Fahrbahnmitte => Reward
+        #    Nur, wenn Lane-IDs übereinstimmen (ansonsten droht positives Feedback auf der falschen Spur)
         lateral_offset = compute_lateral_offset(
             self.vehicle.get_transform(),
-            vehicle_wp.transform
+            current_wp.transform
         )
-        max_offset = 2.0
         offset_magnitude = abs(lateral_offset)
-        if offset_magnitude >= max_offset:
+        max_offset = 2.0
+        if lane_id_mismatch:
+            # Deutliche Strafe statt normaler Spurhaltungsbelohnung
             dist_center_reward = -0.5
         else:
-            # linear abnehmend von 0 -> -0.5
-            dist_center_reward = 0.5 * (1.0 - offset_magnitude / max_offset)
+            if offset_magnitude >= max_offset:
+                dist_center_reward = -0.5
+            else:
+                # linear abnehmend von 0 -> -0.5
+                dist_center_reward = 0.5 * (1.0 - offset_magnitude / max_offset)
 
-        # 3) Geschwindigkeit (m/s)
+        # 5) Geschwindigkeit (m/s)
+        #    Wenn man auf der falschen Lane ist, bitte keinen positiven Speed-Reward
         speed = self.get_vehicle_speed()
         if speed < 0.1:
             speed_reward = -0.3
         else:
             capped_speed = min(speed, 10.0)
-            speed_reward = 0.5 * (capped_speed / 10.0)
+            # Wenn falsche Lane => Speed Reward = 0 (oder negativer Wert)
+            if lane_id_mismatch:
+                speed_reward = 0.0
+            else:
+                speed_reward = 0.5 * (capped_speed / 10.0)
 
-        # Summiere
+        # Gesamtreward
         reward = dist_center_reward + speed_reward
         # clamp auf [-1,1]
         reward = clamp(reward, -1.0, 1.0)
@@ -407,10 +443,18 @@ class CarlaGymEnv(gym.Env):
             self._show_image(seg_img)
 
         # Distanz zur Mitte
-        lateral_offset = compute_lateral_offset(
-            self.vehicle.get_transform(),
-            self.map.get_waypoint(self.vehicle.get_transform().location).transform
+        current_wp = self.map.get_waypoint(
+            self.vehicle.get_transform().location,
+            lane_type=carla.LaneType.Driving
         )
+        if current_wp is not None:
+            lateral_offset = compute_lateral_offset(
+                self.vehicle.get_transform(),
+                current_wp.transform
+            )
+        else:
+            lateral_offset = 0.0
+
         dist_center = np.array([lateral_offset], dtype=np.float32)
 
         # GPS (x,y) Fahrzeug

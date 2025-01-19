@@ -80,11 +80,20 @@ class CollisionSensor:
 class CameraSensor:
     def __init__(self, vehicle, blueprint_library, world, callback):
         self.vehicle = vehicle
+        
+        # Semantische Kamera mit Birdview (Top-Down)
         camera_bp = blueprint_library.find('sensor.camera.semantic_segmentation')
         camera_bp.set_attribute('image_size_x', '640')
         camera_bp.set_attribute('image_size_y', '480')
         camera_bp.set_attribute('fov', '110')
-        transform = carla.Transform(carla.Location(x=1.5, z=2.4))
+
+        # Hier wird der Transform geändert, damit wir eine Vogelperspektive (Top-Down) haben
+        # pitch=-90 => Kamera schaut senkrecht nach unten
+        transform = carla.Transform(
+            carla.Location(x=0.0, y=0.0, z=20.0),
+            carla.Rotation(pitch=-90.0, yaw=0.0, roll=0.0)
+        )
+
         self.sensor = world.spawn_actor(camera_bp, transform, attach_to=vehicle)
         self.callback = callback
         self._listen()
@@ -102,7 +111,7 @@ class CameraSensor:
 class CarlaGymEnv(gym.Env):
     """
     Environment, das:
-      - semantische Kamera (480,640,1) liefert,
+      - semantische Kamera (480x640 Birdview),
       - Distanz zur Fahrbahnmitte,
       - GPS-Koordinate zum nächsten Waypoint,
       - eigene GPS-Koordinate,
@@ -185,7 +194,7 @@ class CarlaGymEnv(gym.Env):
         # Kollision
         self.collision_sensor = CollisionSensor(self.vehicle, self.blueprint_library, self.world)
 
-        # Kamera
+        # Kamera (Birdview semantisch)
         def camera_callback(image):
             image.convert(carla.ColorConverter.Raw)
             array = np.frombuffer(image.raw_data, dtype=np.uint8)
@@ -377,20 +386,19 @@ class CarlaGymEnv(gym.Env):
             return reward, done, info
 
         # 3) Prüfe, ob Lane-IDs übereinstimmen. Wenn nicht => negativer Reward
-        #    (Agent ist auf falscher Lane, obwohl lane_type=Driving, z.B. Gegenfahrbahn)
         lane_id_mismatch = False
         if self.next_waypoint is not None:
             if current_wp.lane_id != self.next_waypoint.lane_id:
                 lane_id_mismatch = True
 
         # 4) Distanz zur Fahrbahnmitte => Reward
-        #    Nur, wenn Lane-IDs übereinstimmen (ansonsten droht positives Feedback auf der falschen Spur)
         lateral_offset = compute_lateral_offset(
             self.vehicle.get_transform(),
             current_wp.transform
         )
         offset_magnitude = abs(lateral_offset)
         max_offset = 2.0
+
         if lane_id_mismatch:
             # Deutliche Strafe statt normaler Spurhaltungsbelohnung
             dist_center_reward = -0.5
@@ -408,7 +416,6 @@ class CarlaGymEnv(gym.Env):
             speed_reward = -0.3
         else:
             capped_speed = min(speed, 10.0)
-            # Wenn falsche Lane => Speed Reward = 0 (oder negativer Wert)
             if lane_id_mismatch:
                 speed_reward = 0.0
             else:
@@ -485,7 +492,7 @@ class CarlaGymEnv(gym.Env):
         seg_img: shape (480,640,1) in [0,1].
         """
         gray = (seg_img[..., 0] * 255).astype(np.uint8)  # (480,640)
-        cv2.imshow("CARLA Semantic Segmentation", gray)
+        cv2.imshow("CARLA Semantic Segmentation (BirdView)", gray)
         cv2.waitKey(1)
 
     def render(self, mode="human"):
